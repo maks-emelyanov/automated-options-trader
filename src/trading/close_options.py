@@ -1,0 +1,374 @@
+import os
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date
+from typing import Dict, List, Tuple
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import (
+    AssetClass,
+    OrderClass,
+    OrderSide,
+    OrderType,
+    PositionIntent,
+    TimeInForce,
+)
+from alpaca.trading.requests import MarketOrderRequest, OptionLegRequest
+from trading.logging_utils import configure_logging, get_logger, log_external_request, log_external_response
+
+
+logger = get_logger(__name__)
+
+
+class AlpacaConfigError(RuntimeError):
+    pass
+
+
+# =========================
+# Data classes
+# =========================
+
+@dataclass
+class OptionPositionInfo:
+    symbol: str
+    underlying: str
+    contract_type: str   # "call" or "put"
+    strike: float
+    expiration: date
+    side: str            # "long" or "short"
+    qty: int
+
+
+@dataclass
+class CalendarPair:
+    underlying: str
+    contract_type: str
+    strike: float
+    leg1: OptionPositionInfo
+    leg2: OptionPositionInfo
+    qty: int
+
+
+# =========================
+# Helpers
+# =========================
+
+def get_trade_client() -> TradingClient:
+    api_key = os.getenv("ALPACA_API_KEY", "")
+    secret_key = os.getenv("ALPACA_SECRET_KEY", "")
+    if not api_key or not secret_key:
+        raise AlpacaConfigError("Set ALPACA_API_KEY and ALPACA_SECRET_KEY before closing positions.")
+    logger.info("Initializing Alpaca trading client for close-options.")
+    return TradingClient(api_key, secret_key, paper=True)
+
+
+def is_dry_run() -> bool:
+    return os.getenv("DRY_RUN", "false").lower() == "true"
+
+
+def enum_value(x) -> str:
+    return getattr(x, "value", str(x))
+
+
+def get_position_qty_available(position) -> int:
+    """
+    Prefer qty_available if present so we do not try to close contracts already tied up
+    in other open orders.
+    """
+    raw = getattr(position, "qty_available", None)
+    if raw is None:
+        raw = getattr(position, "qty", "0")
+    return int(abs(float(raw)))
+
+
+def load_open_option_positions() -> List[OptionPositionInfo]:
+    """
+    Pull all open positions, keep only US options, and enrich them with option contract metadata.
+    """
+    trade_client = get_trade_client()
+    log_external_request(logger, "Alpaca", "get_all_positions", fields={"workflow": "close_options"})
+    positions = trade_client.get_all_positions()
+    log_external_response(
+        logger,
+        "Alpaca",
+        "get_all_positions",
+        fields={"workflow": "close_options"},
+        details=f"positions={len(positions)}",
+    )
+    option_positions: List[OptionPositionInfo] = []
+
+    for position in positions:
+        asset_class = enum_value(getattr(position, "asset_class", ""))
+        if asset_class != AssetClass.US_OPTION.value:
+            continue
+
+        qty = get_position_qty_available(position)
+        if qty < 1:
+            continue
+
+        side = enum_value(getattr(position, "side", "")).lower()
+        if side not in {"long", "short"}:
+            continue
+
+        symbol = position.symbol
+        log_external_request(logger, "Alpaca", "get_option_contract", fields={"symbol": symbol})
+        contract = trade_client.get_option_contract(symbol)
+        log_external_response(
+            logger,
+            "Alpaca",
+            "get_option_contract",
+            fields={"symbol": symbol},
+            details=f"underlying={contract.underlying_symbol} expiration={contract.expiration_date}",
+        )
+
+        option_positions.append(
+            OptionPositionInfo(
+                symbol=symbol,
+                underlying=contract.underlying_symbol,
+                contract_type=enum_value(contract.type).lower(),
+                strike=float(contract.strike_price),
+                expiration=contract.expiration_date,
+                side=side,
+                qty=qty,
+            )
+        )
+
+    logger.info("Identified %s closeable option positions for close-options.", len(option_positions))
+    return option_positions
+
+
+def build_calendar_pairs(option_positions: List[OptionPositionInfo]) -> List[CalendarPair]:
+    """
+    Finds matched calendar spreads by grouping open options by:
+      underlying + option type + strike
+
+    Then pairs opposite-side positions with DIFFERENT expirations.
+    This will match both:
+      - long calendars (near short, far long)
+      - short calendars (near long, far short)
+
+    If quantities differ, it closes only the matched portion and leaves extra orphan legs alone.
+    """
+    grouped: Dict[Tuple[str, str, float], Dict[str, List[dict]]] = defaultdict(
+        lambda: {"long": [], "short": []}
+    )
+
+    for pos in option_positions:
+        key = (pos.underlying, pos.contract_type, pos.strike)
+        grouped[key][pos.side].append({"pos": pos, "remaining": pos.qty})
+
+    pairs: List[CalendarPair] = []
+    logger.info("Grouping %s option positions into potential calendar spreads.", len(option_positions))
+
+    for (underlying, contract_type, strike), bucket in grouped.items():
+        longs = bucket["long"]
+        shorts = bucket["short"]
+
+        while True:
+            candidates = []
+
+            for i, long_entry in enumerate(longs):
+                if long_entry["remaining"] <= 0:
+                    continue
+
+                for j, short_entry in enumerate(shorts):
+                    if short_entry["remaining"] <= 0:
+                        continue
+
+                    long_pos = long_entry["pos"]
+                    short_pos = short_entry["pos"]
+
+                    # Same expiration = not a calendar spread
+                    if long_pos.expiration == short_pos.expiration:
+                        continue
+
+                    exp_gap = abs((long_pos.expiration - short_pos.expiration).days)
+
+                    # Prefer the closest expiration pair first if multiple exist
+                    candidates.append((exp_gap, i, j))
+
+            if not candidates:
+                break
+
+            _, i, j = min(candidates, key=lambda x: x[0])
+
+            long_entry = longs[i]
+            short_entry = shorts[j]
+
+            qty = min(long_entry["remaining"], short_entry["remaining"])
+            if qty <= 0:
+                break
+
+            pairs.append(
+                CalendarPair(
+                    underlying=underlying,
+                    contract_type=contract_type,
+                    strike=strike,
+                    leg1=long_entry["pos"],
+                    leg2=short_entry["pos"],
+                    qty=qty,
+                )
+            )
+            logger.info(
+                "Matched calendar spread: underlying=%s type=%s strike=%.2f qty=%s expirations=%s/%s",
+                underlying,
+                contract_type,
+                strike,
+                qty,
+                long_entry["pos"].expiration,
+                short_entry["pos"].expiration,
+            )
+
+            long_entry["remaining"] -= qty
+            short_entry["remaining"] -= qty
+
+    logger.info("Built %s calendar spread pairs.", len(pairs))
+    return pairs
+
+
+def leg_close_order_fields(pos: OptionPositionInfo):
+    """
+    Convert an existing position into the correct close instruction.
+    """
+    if pos.side == "long":
+        return OrderSide.SELL, PositionIntent.SELL_TO_CLOSE
+    elif pos.side == "short":
+        return OrderSide.BUY, PositionIntent.BUY_TO_CLOSE
+    raise ValueError(f"Unsupported position side: {pos.side}")
+
+
+def make_close_request(pair: CalendarPair) -> MarketOrderRequest:
+    """
+    Submit a 2-leg market MLeg order that closes both sides together.
+    """
+    leg1_side, leg1_intent = leg_close_order_fields(pair.leg1)
+    leg2_side, leg2_intent = leg_close_order_fields(pair.leg2)
+
+    client_order_id = (
+        f"close-cal-{pair.underlying.lower()}-"
+        f"{pair.contract_type[0]}-"
+        f"{int(pair.strike * 1000)}-"
+        f"{pair.leg1.expiration:%Y%m%d}-"
+        f"{pair.leg2.expiration:%Y%m%d}"
+    )[:48]
+
+    return MarketOrderRequest(
+        qty=pair.qty,
+        type=OrderType.MARKET,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.MLEG,
+        client_order_id=client_order_id,
+        legs=[
+            OptionLegRequest(
+                symbol=pair.leg1.symbol,
+                ratio_qty=1,
+                side=leg1_side,
+                position_intent=leg1_intent,
+            ),
+            OptionLegRequest(
+                symbol=pair.leg2.symbol,
+                ratio_qty=1,
+                side=leg2_side,
+                position_intent=leg2_intent,
+            ),
+        ],
+    )
+
+
+def describe_pair(pair: CalendarPair) -> str:
+    near = pair.leg1 if pair.leg1.expiration < pair.leg2.expiration else pair.leg2
+    far = pair.leg2 if near is pair.leg1 else pair.leg1
+
+    spread_kind = "long calendar" if near.side == "short" and far.side == "long" else "short calendar"
+
+    return (
+        f"{pair.underlying} {pair.contract_type.upper()} strike {pair.strike:.2f} "
+        f"| near {near.expiration} ({near.side} {near.symbol}) "
+        f"| far {far.expiration} ({far.side} {far.symbol}) "
+        f"| qty {pair.qty} | detected as {spread_kind}"
+    )
+
+
+def close_open_calendar_spreads() -> Dict[str, object]:
+    configure_logging()
+    trade_client = get_trade_client()
+    logger.info("Starting end-to-end close-options session.")
+    option_positions = load_open_option_positions()
+
+    if not option_positions:
+        logger.info("No open option positions found; skipping close-options order submission.")
+        return {
+            "status": "completed",
+            "detected_spread_count": 0,
+            "submitted_order_count": 0,
+            "failed_order_count": 0,
+            "dry_run": is_dry_run(),
+        }
+
+    pairs = build_calendar_pairs(option_positions)
+
+    if not pairs:
+        logger.info("No open calendar spreads detected; skipping close-options order submission.")
+        return {
+            "status": "completed",
+            "detected_spread_count": 0,
+            "submitted_order_count": 0,
+            "failed_order_count": 0,
+            "dry_run": is_dry_run(),
+        }
+
+    logger.info("Proceeding to close %s detected calendar spread(s).", len(pairs))
+    for pair in pairs:
+        logger.info("Calendar spread candidate: %s", describe_pair(pair))
+
+    submitted_order_count = 0
+    failed_order_count = 0
+    dry_run = is_dry_run()
+
+    for pair in pairs:
+        req = make_close_request(pair)
+
+        if dry_run:
+            logger.info("[%s] DRY RUN enabled; order not submitted.", pair.underlying)
+            continue
+
+        try:
+            log_external_request(
+                logger,
+                "Alpaca",
+                "submit_order",
+                fields={"workflow": "close_options", "client_order_id": req.client_order_id, "underlying": pair.underlying},
+            )
+            order = trade_client.submit_order(req)
+            log_external_response(
+                logger,
+                "Alpaca",
+                "submit_order",
+                fields={"workflow": "close_options", "client_order_id": req.client_order_id, "underlying": pair.underlying},
+                details=f"order_id={order.id} status={order.status}",
+            )
+            logger.info("[%s] Order submitted successfully: order_id=%s status=%s", pair.underlying, order.id, order.status)
+            submitted_order_count += 1
+        except Exception as exc:
+            logger.exception("[%s] Skipped due to error while closing spread: %s", pair.underlying, exc)
+            failed_order_count += 1
+
+    logger.info(
+        "Close-options session completed: detected_spread_count=%s submitted_order_count=%s failed_order_count=%s dry_run=%s",
+        len(pairs),
+        submitted_order_count,
+        failed_order_count,
+        dry_run,
+    )
+
+    return {
+        "status": "completed",
+        "detected_spread_count": len(pairs),
+        "submitted_order_count": submitted_order_count,
+        "failed_order_count": failed_order_count,
+        "dry_run": dry_run,
+    }
+
+
+if __name__ == "__main__":
+    configure_logging()
+    close_open_calendar_spreads()

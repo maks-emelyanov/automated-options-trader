@@ -1,0 +1,50 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+*.pyd
+*.so
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+
+# Packaging and local tool state
+.cache/
+.DS_Store
+pip-wheel-metadata/
+
+# Terraform and Terragrunt artifacts
+.terraform/
+.terragrunt-cache/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+
+# Lambda build artifacts
+infra/modules/scheduled-python-lambda/.dist/
+
+# Editor and OS files
+.idea/
+.vscode/
+*.swp
+*.swo

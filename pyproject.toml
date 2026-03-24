@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "trading"
+version = "0.1.0"
+description = "Lambda-based trading automation for earnings entry and calendar spread exits."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "GPL-3.0-only" }
+authors = [
+    { name = "Repository Maintainer" },
+]
+keywords = ["alpaca", "aws-lambda", "options", "terragrunt", "trading"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "aiohttp>=3.13.3",
+    "alpaca-py>=0.43.2",
+    "numpy>=2.3.0",
+    "pandas>=3.0.1",
+    "pytz>=2026.1.post1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/trading"]

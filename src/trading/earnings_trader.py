@@ -1,0 +1,1357 @@
+import os
+import asyncio
+import math
+import aiohttp
+import pandas as pd
+import numpy as np
+from dataclasses import dataclass
+from datetime import datetime, timedelta, date
+from zoneinfo import ZoneInfo
+from typing import Optional, Dict, Any, List, Tuple, Iterable
+import io
+import csv
+from collections import deque
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    GetOptionContractsRequest,
+    LimitOrderRequest,
+    OptionLegRequest,
+)
+from alpaca.trading.enums import (
+    AssetStatus,
+    ContractType,
+    OrderClass,
+    OrderSide,
+    OrderType,
+    TimeInForce,
+)
+from alpaca.data.historical.stock import StockHistoricalDataClient
+from alpaca.data.historical.option import OptionHistoricalDataClient
+from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
+from trading.logging_utils import configure_logging, get_logger, log_external_request, log_external_response
+
+
+logger = get_logger(__name__)
+
+# -----------------------------
+# Config
+# -----------------------------
+TRADIER_BASE_URL = "https://api.tradier.com"
+TRADIER_TOKEN = os.getenv("TRADIER_TOKEN", "")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")
+ALPHAVANTAGE_URL = "https://www.alphavantage.co/query"
+ALPHAVANTAGE_FN = "EARNINGS_CALENDAR"
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+
+PCT_OF_AVAILABLE = float(os.getenv("PCT_OF_AVAILABLE", "0.06"))
+ACCOUNT_VALUE_FIELD = os.getenv("ACCOUNT_VALUE_FIELD", "cash")
+BUDGET_MODE = os.getenv("BUDGET_MODE", "per_symbol")
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
+STRIKE_WINDOW_PCT = float(os.getenv("STRIKE_WINDOW_PCT", "0.10"))
+CONTRACT_QUERY_LIMIT = int(os.getenv("CONTRACT_QUERY_LIMIT", "10000"))
+USE_MID_DEBIT = os.getenv("USE_MID_DEBIT", "false").lower() == "true"
+MIN_NET_DEBIT = float(os.getenv("MIN_NET_DEBIT", "0.01"))
+MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
+
+class AlphaVantageError(RuntimeError):
+    ...
+
+
+class TradierError(RuntimeError):
+    ...
+
+
+class AlpacaConfigError(RuntimeError):
+    ...
+
+
+@dataclass
+class SpreadCandidate:
+    underlying: str
+    spot: float
+    strike: float
+    short_exp: date
+    long_exp: date
+    short_symbol: str
+    long_symbol: str
+    short_bid: float
+    short_ask: float
+    long_bid: float
+    long_ask: float
+    natural_debit: float
+    mid_debit: float
+
+
+# -----------------------------
+# Small utilities
+# -----------------------------
+def _as_float(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(x):
+    try:
+        return int(x) if x is not None else None
+    except Exception:
+        return None
+
+
+def _safe_float(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None
+
+
+def _log_http_request(service: str, url: str, *, params: Optional[Dict[str, Any]] = None) -> None:
+    log_external_request(logger, service, "GET", fields={"url": url, **(params or {})})
+
+
+def _log_http_response(
+    service: str,
+    url: str,
+    *,
+    status: int,
+    params: Optional[Dict[str, Any]] = None,
+    details: Optional[str] = None,
+) -> None:
+    log_external_response(
+        logger,
+        service,
+        "GET",
+        fields={"url": url, "status": status, **(params or {})},
+        details=details,
+    )
+
+
+def filter_dates(dates: List[str]) -> List[str]:
+    today = datetime.today().date()
+    cutoff_date = today + timedelta(days=45)
+    sorted_dates = sorted(datetime.strptime(d, "%Y-%m-%d").date() for d in dates)
+    arr = []
+    for i, d in enumerate(sorted_dates):
+        if d >= cutoff_date:
+            arr = [x.strftime("%Y-%m-%d") for x in sorted_dates[:i+1]]
+            break
+    if arr:
+        if arr[0] == today.strftime("%Y-%m-%d"):
+            return arr[1:]
+        return arr
+    raise ValueError("No date 45 days or more in the future found.")
+
+
+def yang_zhang(price_data: pd.DataFrame, window=30, trading_periods=252, return_last_only=True):
+    log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
+    log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
+    log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
+
+    log_oc = (price_data['Open'] / price_data['Close'].shift(1)).apply(np.log)
+    log_oc_sq = log_oc**2
+    log_cc = (price_data['Close'] / price_data['Close'].shift(1)).apply(np.log)
+    log_cc_sq = log_cc**2
+
+    rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
+
+    close_vol = log_cc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+    open_vol = log_oc_sq.rolling(window=window).sum() * (1.0 / (window - 1.0))
+    window_rs = rs.rolling(window=window).sum() * (1.0 / (window - 1.0))
+
+    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
+    result = (open_vol + k * close_vol + (1 - k) * window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
+    return result.iloc[-1] if return_last_only else result.dropna()
+
+
+def build_term_structure(days, ivs):
+    days = np.array(days, dtype=float)
+    ivs = np.array(ivs, dtype=float)
+    idx = days.argsort()
+    days = days[idx]
+    ivs = ivs[idx]
+
+    def term_spline(dte):
+        if dte < days[0]:
+            return float(ivs[0])
+        if dte > days[-1]:
+            return float(ivs[-1])
+        return float(np.interp(dte, days, ivs))
+
+    return term_spline
+
+
+def is_tomorrow(s: str, fmt: str = "%Y-%m-%d", tz: str = "America/New_York") -> bool:
+    tzinfo = ZoneInfo(tz)
+    tomorrow = (datetime.now(tzinfo).date() + timedelta(days=1))
+    try:
+        d = datetime.strptime(s, fmt).date()
+    except ValueError:
+        return False
+    return d == tomorrow
+
+
+# -----------------------------
+# S&P 500 helpers
+# -----------------------------
+def _normalize_symbol(sym: str) -> str:
+    """
+    Normalize ticker symbols so that variants like 'BRK.B' and 'BRK-B'
+    compare consistently.
+    """
+    return (sym or "").strip().upper().replace(".", "-")
+
+
+def get_sp500_tickers() -> set[str]:
+    """
+    Fetch the current S&P 500 constituents from a public CSV dataset
+    and return a set of normalized ticker symbols.
+    """
+    url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
+    logger.info("Loading S&P 500 constituents from %s", url)
+
+    df = pd.read_csv(url)
+
+    if "Symbol" not in df.columns:
+        raise RuntimeError(
+            f"Could not find 'Symbol' column in S&P 500 CSV. Got columns: {list(df.columns)}"
+        )
+
+    symbols = (
+        df["Symbol"]
+        .astype(str)
+        .map(_normalize_symbol)
+    )
+    logger.info("Loaded %s normalized S&P 500 symbols.", len(symbols))
+    return set(symbols)
+
+
+def filter_results_to_sp500(results: Dict[str, str]) -> Dict[str, str]:
+    """
+    Given the results dict from async_main (symbol -> recommendation),
+    return a new dict containing only symbols that are in the S&P 500.
+    If fetching the S&P list fails, return an empty dict.
+    """
+    try:
+        sp500 = get_sp500_tickers()
+    except Exception:
+        logger.exception("Failed to filter results to S&P 500 membership.")
+        return {}
+    logger.info("Filtering %s recommendations against %s S&P 500 symbols.", len(results), len(sp500))
+    return {
+        sym: rec
+        for sym, rec in results.items()
+        if _normalize_symbol(sym) in sp500
+    }
+
+
+def filter_recommended_sp500_symbols(results: Dict[str, str]) -> List[str]:
+    """
+    Return sorted ticker symbols whose recommendation is exactly
+    "Recommended" and that are members of the S&P 500.
+    """
+    sp500_results = filter_results_to_sp500(results)
+    return sorted(
+        sym
+        for sym, rec in sp500_results.items()
+        if rec == "Recommended"
+    )
+
+
+# -----------------------------
+# Simple per-minute rate limiter
+# -----------------------------
+class PerMinuteRateLimiter:
+    def __init__(self, per_minute: int):
+        self.per_minute = per_minute
+        self.calls: deque[float] = deque()
+        self._lock = asyncio.Lock()
+
+    async def acquire(self):
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            window_start = now - 60.0
+            while self.calls and self.calls[0] < window_start:
+                self.calls.popleft()
+            if len(self.calls) < self.per_minute:
+                self.calls.append(now)
+                return
+            sleep_for = 60.0 - (now - self.calls[0])
+            await asyncio.sleep(max(0.0, sleep_for))
+            now2 = asyncio.get_running_loop().time()
+            while self.calls and self.calls[0] < (now2 - 60.0):
+                self.calls.popleft()
+            self.calls.append(now2)
+
+
+# -----------------------------
+# HTTP helpers (aiohttp)
+# -----------------------------
+def _tradier_headers() -> Dict[str, str]:
+    if not TRADIER_TOKEN:
+        raise TradierError("TRADIER_TOKEN environment variable is not set.")
+    return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
+
+
+async def _json_or_text(resp: aiohttp.ClientResponse) -> Any:
+    ctype = resp.headers.get("Content-Type", "")
+    if "application/json" in ctype:
+        return await resp.json()
+    return await resp.text()
+
+
+async def _aio_get_json(
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    params=None,
+    headers=None,
+    timeout: float = 20.0,
+) -> Any:
+    _log_http_request("Tradier", url, params=params)
+    try:
+        async with session.get(url, params=params, headers=headers, timeout=timeout) as r:
+            if r.status == 429:
+                _log_http_response("Tradier", url, status=r.status, params=params, details="rate_limited")
+                raise RuntimeError("API rate limit reached (HTTP 429).")
+            r.raise_for_status()
+            payload = await r.json()
+            _log_http_response("Tradier", url, status=r.status, params=params)
+            return payload
+    except aiohttp.ClientResponseError as e:
+        logger.warning("Tradier request failed: url=%s status=%s message=%s", url, e.status, e.message)
+        raise RuntimeError(f"HTTP error {e.status}: {e.message}") from e
+    except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+        logger.warning("Tradier network request failed: url=%s error=%s", url, e)
+        raise RuntimeError(f"Network error: {e}") from e
+
+
+# -----------------------------
+# Tradier (async)
+# -----------------------------
+async def get_current_price(session: aiohttp.ClientSession, symbol: str) -> float:
+    logger.info("Fetching current price for %s from Tradier.", symbol)
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/quotes",
+        params={"symbols": symbol},
+        headers=_tradier_headers(),
+    )
+    quote = data.get("quotes", {}).get("quote")
+    if quote is None:
+        raise ValueError("No quote data.")
+    if isinstance(quote, list):
+        quote = quote[0]
+    last = _as_float(quote.get("last")) or _as_float(quote.get("close"))
+    if last is None:
+        raise ValueError("No market price.")
+    logger.info("Fetched current price for %s: %.4f", symbol, last)
+    return last
+
+
+async def get_price_history(
+    session: aiohttp.ClientSession, symbol: str, start_date: datetime, end_date: datetime
+) -> pd.DataFrame:
+    logger.info(
+        "Fetching price history for %s from %s to %s.",
+        symbol,
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+    )
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/history",
+        params={
+            "symbol": symbol,
+            "start": start_date.strftime("%Y-%m-%d"),
+            "end": end_date.strftime("%Y-%m-%d"),
+        },
+        headers=_tradier_headers(),
+    )
+    days = data.get("history", {}).get("day", [])
+    if not days:
+        raise ValueError("No historical data.")
+    if isinstance(days, dict):
+        days = [days]
+    df = pd.DataFrame(
+        [
+            {
+                "Date": d.get("date"),
+                "Open": _as_float(d.get("open")),
+                "High": _as_float(d.get("high")),
+                "Low": _as_float(d.get("low")),
+                "Close": _as_float(d.get("close")),
+                "Volume": _as_float(d.get("volume")),
+            }
+            for d in days
+        ]
+    )
+    cleaned = df.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
+    logger.info("Fetched %s cleaned historical price rows for %s.", len(cleaned), symbol)
+    return cleaned
+
+
+async def get_expirations(session: aiohttp.ClientSession, symbol: str) -> List[str]:
+    logger.info("Fetching option expirations for %s.", symbol)
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/options/expirations",
+        params={"symbol": symbol, "includeAllRoots": "true", "strikes": "false"},
+        headers=_tradier_headers(),
+    )
+    exps = data.get("expirations", {}).get("date", [])
+    if not exps:
+        logger.info("No option expirations returned for %s.", symbol)
+        return []
+    expirations = [exps] if isinstance(exps, str) else exps
+    logger.info("Fetched %s expirations for %s.", len(expirations), symbol)
+    return expirations
+
+
+async def get_option_chain(
+    session: aiohttp.ClientSession, symbol: str, expiration: str
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    logger.info("Fetching option chain for %s expiration %s.", symbol, expiration)
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/options/chains",
+        params={"symbol": symbol, "expiration": expiration, "greeks": "true"},
+        headers=_tradier_headers(),
+    )
+    options = data.get("options", {}).get("option", [])
+    if not options:
+        empty = pd.DataFrame(columns=["strike", "bid", "ask", "impliedVolatility"])
+        logger.info("No option chain rows returned for %s expiration %s.", symbol, expiration)
+        return empty, empty
+    if isinstance(options, dict):
+        options = [options]
+    rows = []
+    for opt in options:
+        g = opt.get("greeks", {}) or {}
+        iv = (
+            _as_float(g.get("mid_iv"))
+            or (lambda b, a: (b + a) / 2.0 if (b is not None and a is not None) else None)(
+                _as_float(g.get("bid_iv")), _as_float(g.get("ask_iv"))
+            )
+            or _as_float(g.get("smv_vol"))
+        )
+        rows.append(
+            {
+                "type": opt.get("option_type"),
+                "strike": _as_float(opt.get("strike")),
+                "bid": _as_float(opt.get("bid")),
+                "ask": _as_float(opt.get("ask")),
+                "impliedVolatility": iv,
+            }
+        )
+    df = pd.DataFrame(rows).dropna(subset=["strike", "bid", "ask"])
+    calls = df[df["type"] == "call"][["strike", "bid", "ask", "impliedVolatility"]].reset_index(
+        drop=True
+    )
+    puts = df[df["type"] == "put"][["strike", "bid", "ask", "impliedVolatility"]].reset_index(
+        drop=True
+    )
+    logger.info(
+        "Fetched option chain for %s expiration %s: calls=%s puts=%s",
+        symbol,
+        expiration,
+        len(calls),
+        len(puts),
+    )
+    return calls, puts
+
+
+# -----------------------------
+# Recommendation logic (async)
+# -----------------------------
+async def recommend_ticker(session: aiohttp.ClientSession, ticker: str) -> str:
+    try:
+        symbol = (ticker or "").strip().upper()
+        if not symbol:
+            logger.info("Received blank ticker; defaulting recommendation to Avoid.")
+            return "Avoid"
+
+        logger.info("Starting recommendation analysis for %s.", symbol)
+        exps = await get_expirations(session, symbol)
+        if not exps:
+            logger.info("[%s] Recommendation Avoid: no expirations available.", symbol)
+            return "Avoid"
+        try:
+            exps = filter_dates(exps)
+            logger.info("[%s] Filtered expirations down to %s target dates.", symbol, len(exps))
+        except Exception:
+            logger.info("[%s] Recommendation Avoid: expirations did not meet the date filter.", symbol)
+            return "Avoid"
+
+        try:
+            underlying = await get_current_price(session, symbol)
+        except Exception:
+            logger.info("[%s] Recommendation Avoid: unable to fetch current price.", symbol)
+            return "Avoid"
+
+        atm_iv_by_exp = {}
+        straddle_mid = None
+        for i, exp in enumerate(exps):
+            calls, puts = await get_option_chain(session, symbol, exp)
+            if calls.empty or puts.empty:
+                logger.info("[%s] Skipping expiration %s because the call or put chain is empty.", symbol, exp)
+                continue
+            call_idx = (calls["strike"] - underlying).abs().idxmin()
+            put_idx = (puts["strike"] - underlying).abs().idxmin()
+            call_iv = calls.loc[call_idx, "impliedVolatility"]
+            put_iv = puts.loc[put_idx, "impliedVolatility"]
+
+            if pd.isna(call_iv) and pd.isna(put_iv):
+                continue
+            elif pd.isna(call_iv):
+                atm_iv = put_iv
+            elif pd.isna(put_iv):
+                atm_iv = call_iv
+            else:
+                atm_iv = (call_iv + put_iv) / 2.0
+            atm_iv_by_exp[exp] = atm_iv
+
+            if i == 0:
+                cb, ca = calls.loc[call_idx, "bid"], calls.loc[call_idx, "ask"]
+                pb, pa = puts.loc[put_idx, "bid"], puts.loc[put_idx, "ask"]
+                if cb is not None and ca is not None and pb is not None and pa is not None:
+                    straddle_mid = (cb + ca) / 2.0 + (pb + pa) / 2.0  # noqa: F841
+
+        if not atm_iv_by_exp:
+            logger.info("[%s] Recommendation Avoid: no ATM implied volatility values available.", symbol)
+            return "Avoid"
+
+        today = datetime.today().date()
+        dtes, ivs = [], []
+        for exp, iv in atm_iv_by_exp.items():
+            dte = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
+            dtes.append(dte)
+            ivs.append(iv)
+        term = build_term_structure(dtes, ivs)
+        ts_slope_0_45 = (term(45) - term(dtes[0])) / (45 - dtes[0])
+
+        end = datetime.today()
+        start = end - timedelta(days=100)
+        hist = await get_price_history(session, symbol, start, end)
+        if hist.empty or len(hist) < 31:
+            logger.info("[%s] Recommendation Avoid: insufficient history rows=%s.", symbol, len(hist))
+            return "Avoid"
+
+        iv30_rv30 = term(30) / yang_zhang(hist)
+        avg_vol_ok = hist["Volume"].rolling(30).mean().dropna()
+        if avg_vol_ok.empty:
+            logger.info("[%s] Recommendation Avoid: average volume series is empty.", symbol)
+            return "Avoid"
+        avg_volume_pass = avg_vol_ok.iloc[-1] >= 1_500_000
+
+        iv30_rv30_pass = iv30_rv30 >= 1.25
+        ts_slope_pass = ts_slope_0_45 <= -0.00406
+
+        logger.info(
+            "[%s] Metrics: iv30_rv30=%.4f pass=%s avg_volume=%.2f pass=%s ts_slope_0_45=%.6f pass=%s",
+            symbol,
+            iv30_rv30,
+            iv30_rv30_pass,
+            avg_vol_ok.iloc[-1],
+            avg_volume_pass,
+            ts_slope_0_45,
+            ts_slope_pass,
+        )
+        if avg_volume_pass and iv30_rv30_pass and ts_slope_pass:
+            logger.info("[%s] Recommendation result: Recommended.", symbol)
+            return "Recommended"
+        if ts_slope_pass and (
+            (avg_volume_pass and not iv30_rv30_pass)
+            or (iv30_rv30_pass and not avg_volume_pass)
+        ):
+            logger.info("[%s] Recommendation result: Consider.", symbol)
+            return "Consider"
+        logger.info("[%s] Recommendation result: Avoid.", symbol)
+        return "Avoid"
+    except Exception:
+        logger.exception("[%s] Recommendation failed unexpectedly; defaulting to Avoid.", ticker)
+        return "Avoid"
+
+
+# -----------------------------
+# Alpha Vantage calendar (async)
+# -----------------------------
+def _parse_av_json(data: dict) -> Iterable[Dict[str, Any]]:
+    """
+    Expected shape:
+      {"earningsCalendar": [{"symbol":"AAPL","name":"Apple Inc","reportDate":"2025-10-06","reportTime":"amc", ...}, ...]}
+    """
+    if not isinstance(data, dict):
+        return []
+    # Handle AV throttle messages
+    if any(k in data for k in ("Note", "Information", "Error Message")):
+        msg = data.get("Note") or data.get("Information") or data.get("Error Message")
+        raise AlphaVantageError(f"Alpha Vantage response: {msg}")
+    arr = data.get("earningsCalendar") or []
+    return arr if isinstance(arr, list) else []
+
+
+def _parse_av_csv(text: str) -> Iterable[Dict[str, Any]]:
+    f = io.StringIO(text)
+    reader = csv.DictReader(f)
+    for row in reader:
+        yield row
+
+
+def _is_pre_market_report_time(value: str) -> bool:
+    """
+    Return True if Alpha Vantage's time-of-day field indicates
+    a before-market-hours earnings release.
+
+    Handles short codes ('bmo', 'bto') and text like
+    'pre-market', 'before market open', etc.
+    """
+    if not value:
+        return False
+
+    v = value.strip().lower()
+
+    # Short codes commonly used ("before market open")
+    if v in {"bmo", "bto"}:
+        return True
+
+    # Text variants
+    if "before" in v and "market" in v:
+        return True
+    if "pre-market" in v or "pre market" in v or "premarket" in v:
+        return True
+
+    return False
+
+
+def _is_after_market_report_time(value: str) -> bool:
+    """
+    Return True if Alpha Vantage's time-of-day field indicates
+    an after-market-hours earnings release.
+
+    Handles short codes ('amc', 'pmc') and text like
+    'after-market', 'after market close', 'after hours', 'post-market', etc.
+    """
+    if not value:
+        return False
+
+    v = value.strip().lower()
+
+    # Short codes commonly used ("after market close")
+    if v in {"amc", "pmc"}:
+        return True
+
+    # Text variants
+    if "after" in v and "market" in v:
+        return True
+    if "after" in v and "close" in v:
+        return True
+    if "after-hours" in v or "after hours" in v or "afterhours" in v:
+        return True
+    if "post-market" in v or "post market" in v or "postmarket" in v:
+        return True
+
+    return False
+
+
+async def fetch_alpha_vantage_calendar(
+    session: aiohttp.ClientSession, *, horizon: str = "3month"
+) -> List[Dict[str, Any]]:
+    """
+    Fetch AV earnings calendar (single request). Returns list[dict] of rows.
+    Requires env var ALPHAVANTAGE_API_KEY.
+    """
+    if not ALPHAVANTAGE_API_KEY:
+        raise AlphaVantageError("Set ALPHAVANTAGE_API_KEY in your environment.")
+
+    params = {
+        "function": ALPHAVANTAGE_FN,
+        "horizon": horizon,
+        "apikey": ALPHAVANTAGE_API_KEY,
+        # "datatype": "json"
+    }
+
+    _log_http_request("Alpha Vantage", ALPHAVANTAGE_URL, params=params)
+    async with session.get(ALPHAVANTAGE_URL, params=params, timeout=30) as resp:
+        # AV often returns 200 even on throttle; detect by content
+        text = await resp.text()
+        rows: List[Dict[str, Any]] = []
+        try:
+            data = await resp.json()
+            rows.extend(_parse_av_json(data))
+            _log_http_response(
+                "Alpha Vantage",
+                ALPHAVANTAGE_URL,
+                status=resp.status,
+                params=params,
+                details=f"json_rows={len(rows)}",
+            )
+        except Exception:
+            # Not JSON (or had a Note/Error) → parse as CSV
+            rows.extend(_parse_av_csv(text))
+            _log_http_response(
+                "Alpha Vantage",
+                ALPHAVANTAGE_URL,
+                status=resp.status,
+                params=params,
+                details=f"csv_rows={len(rows)}",
+            )
+        return rows
+
+
+async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], List[str]]:
+    """
+    Return two unique symbol lists from Alpha Vantage (US/Eastern):
+      - pre_market_tomorrow:  next business day's pre-market earnings
+      - after_market_today:   today's (or next business day's) after-market earnings
+
+    If today is Sat/Sun, 'today' is taken as Monday (next business day),
+    and 'tomorrow' is the next business day after that.
+    """
+    tz = ZoneInfo("America/New_York")
+    today = datetime.now(tz).date()
+
+    # Business "today": if weekend, roll forward to Monday
+    days_ahead_today = 0
+    while (today + timedelta(days=days_ahead_today)).weekday() >= 5:  # 5 = Sat, 6 = Sun
+        days_ahead_today += 1
+    business_today = today + timedelta(days=days_ahead_today)
+
+    # Next business day after business_today
+    days_ahead_next = 1
+    while (business_today + timedelta(days=days_ahead_next)).weekday() >= 5:
+        days_ahead_next += 1
+    business_tomorrow = business_today + timedelta(days=days_ahead_next)
+    logger.info(
+        "Fetching Alpha Vantage earnings calendar for business_today=%s business_tomorrow=%s.",
+        business_today,
+        business_tomorrow,
+    )
+
+    timeout = aiohttp.ClientTimeout(total=40)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        rows = await fetch_alpha_vantage_calendar(session)
+    logger.info("Fetched %s earnings calendar rows from Alpha Vantage.", len(rows))
+
+    pre_market_tomorrow: List[str] = []
+    after_market_today: List[str] = []
+    seen_pre = set()
+    seen_after = set()
+
+    target_today = business_today.isoformat()
+    target_tomorrow = business_tomorrow.isoformat()
+
+    for r in rows:
+        d = (r.get("reportDate") or "").strip()[:10]
+        sym = (r.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+
+        # Alpha Vantage CSV has 'timeOfTheDay' as the header for time-of-day info.
+        # JSON (if ever used) may use 'reportTime'. Be robust and check multiple keys.
+        rt_raw = (
+            r.get("reportTime")
+            or r.get("timeOfTheDay")
+            or r.get("time_of_the_day")
+            or r.get("time")
+            or ""
+        )
+        rt_raw = rt_raw.strip()
+
+        # After-market earnings for business_today
+        if (
+            d == target_today
+            and sym not in seen_after
+            and _is_after_market_report_time(rt_raw)
+        ):
+            seen_after.add(sym)
+            after_market_today.append(sym)
+
+        # Pre-market earnings for business_tomorrow
+        if (
+            d == target_tomorrow
+            and sym not in seen_pre
+            and _is_pre_market_report_time(rt_raw)
+        ):
+            seen_pre.add(sym)
+            pre_market_tomorrow.append(sym)
+
+    logger.info(
+        "Alpha Vantage classification complete: pre_market_tomorrow=%s after_market_today=%s",
+        len(pre_market_tomorrow),
+        len(after_market_today),
+    )
+    return pre_market_tomorrow, after_market_today
+
+
+# -----------------------------
+# Alpaca paper trading helpers
+# -----------------------------
+def get_alpaca_clients() -> Tuple[
+    TradingClient,
+    StockHistoricalDataClient,
+    OptionHistoricalDataClient,
+]:
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise AlpacaConfigError(
+            "Set ALPACA_API_KEY and ALPACA_SECRET_KEY before paper trading."
+        )
+
+    logger.info("Initializing Alpaca trading and market data clients for paper trading.")
+    trade_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
+    stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+    return trade_client, stock_data_client, option_data_client
+
+
+def minutes_until_session_close(trade_client: TradingClient) -> Optional[float]:
+    """
+    Returns the number of minutes remaining until the current market session closes.
+
+    Returns None when the market is not currently open.
+    """
+    logger.info("Requesting Alpaca market clock to calculate minutes until session close.")
+    clock = trade_client.get_clock()
+    if not getattr(clock, "is_open", False):
+        logger.info("Alpaca clock indicates the market is closed.")
+        return None
+
+    now = clock.timestamp
+    close_time = clock.next_close
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=ZoneInfo(MARKET_TIMEZONE))
+    if close_time.tzinfo is None:
+        close_time = close_time.replace(tzinfo=ZoneInfo(MARKET_TIMEZONE))
+
+    minutes_remaining = (close_time - now).total_seconds() / 60.0
+    logger.info("Alpaca clock indicates %.2f minutes until session close.", minutes_remaining)
+    return minutes_remaining
+
+
+def get_account_value(trade_client: TradingClient) -> float:
+    """
+    Returns the account value field used for sizing, e.g. cash or buying_power.
+    """
+    logger.info("Requesting Alpaca account data for sizing using field '%s'.", ACCOUNT_VALUE_FIELD)
+    account = trade_client.get_account()
+    raw_value = getattr(account, ACCOUNT_VALUE_FIELD)
+    value = float(raw_value)
+    logger.info("Fetched Alpaca account field '%s' with value %.2f.", ACCOUNT_VALUE_FIELD, value)
+    return value
+
+
+def get_next_trading_session_date(trade_client: TradingClient) -> date:
+    """
+    Uses Alpaca's clock.next_open.
+    - If market is closed before today's open, next_open is today.
+    - If market is currently open, next_open is the following session.
+    - If market is closed after hours, next_open is the following session.
+    """
+    logger.info("Requesting Alpaca market clock to determine the next trading session date.")
+    clock = trade_client.get_clock()
+    next_open_date = clock.next_open.date()
+    logger.info("Alpaca next trading session date resolved to %s.", next_open_date)
+    return next_open_date
+
+
+def get_spot_price(stock_data_client: StockHistoricalDataClient, symbol: str) -> float:
+    logger.info("Requesting Alpaca latest stock trade for %s.", symbol)
+    resp = stock_data_client.get_stock_latest_trade(
+        StockLatestTradeRequest(symbol_or_symbols=symbol)
+    )
+
+    if isinstance(resp, dict):
+        trade = resp[symbol]
+    else:
+        trade = resp
+
+    price = float(trade.price)
+    logger.info("Fetched Alpaca latest stock trade for %s: %.4f", symbol, price)
+    return price
+
+
+def get_latest_option_quote(
+    option_data_client: OptionHistoricalDataClient, symbol: str
+):
+    logger.info("Requesting Alpaca latest option quote for %s.", symbol)
+    resp = option_data_client.get_option_latest_quote(
+        OptionLatestQuoteRequest(symbol_or_symbols=symbol)
+    )
+
+    if isinstance(resp, dict):
+        quote = resp[symbol]
+    else:
+        quote = resp
+    logger.info(
+        "Fetched Alpaca latest option quote for %s: bid=%s ask=%s",
+        symbol,
+        getattr(quote, "bid_price", None),
+        getattr(quote, "ask_price", None),
+    )
+    return quote
+
+
+def fetch_call_contracts(
+    trade_client: TradingClient,
+    underlying: str,
+    min_exp: date,
+    max_exp: date,
+    min_strike: float,
+    max_strike: float,
+) -> List[Any]:
+    """
+    Fetch all active call contracts in the requested expiration / strike range.
+    """
+    page_token = None
+    all_contracts: List[Any] = []
+    logger.info(
+        "Fetching Alpaca call contracts for %s between expirations %s and %s with strike window %.2f-%.2f.",
+        underlying,
+        min_exp,
+        max_exp,
+        min_strike,
+        max_strike,
+    )
+
+    while True:
+        req = GetOptionContractsRequest(
+            underlying_symbols=[underlying],
+            status=AssetStatus.ACTIVE,
+            type=ContractType.CALL,
+            expiration_date_gte=min_exp,
+            expiration_date_lte=max_exp,
+            strike_price_gte=f"{min_strike:.2f}",
+            strike_price_lte=f"{max_strike:.2f}",
+            limit=CONTRACT_QUERY_LIMIT,
+            page_token=page_token,
+        )
+        logger.info(
+            "Requesting Alpaca option contracts page for %s with page_token=%s limit=%s.",
+            underlying,
+            page_token,
+            CONTRACT_QUERY_LIMIT,
+        )
+        resp = trade_client.get_option_contracts(req)
+        contracts = resp.option_contracts or []
+        logger.info(
+            "Received %s option contracts for %s on page_token=%s.",
+            len(contracts),
+            underlying,
+            page_token,
+        )
+
+        for contract in contracts:
+            if getattr(contract, "tradable", True):
+                all_contracts.append(contract)
+
+        page_token = resp.next_page_token
+        if not page_token:
+            break
+
+    logger.info("Collected %s tradable call contracts for %s.", len(all_contracts), underlying)
+    return all_contracts
+
+
+def choose_expirations(
+    contracts: List[Any],
+    short_target: date,
+    long_target: date,
+) -> Tuple[date, date]:
+    """
+    Choose:
+      - short expiration = nearest available expiration on/after short_target
+      - long expiration  = nearest later expiration to long_target
+    """
+    expirations = sorted({contract.expiration_date for contract in contracts})
+
+    short_candidates = [exp for exp in expirations if exp >= short_target]
+    if not short_candidates:
+        raise ValueError("No available expiration on/after the next trading session.")
+
+    short_exp = min(short_candidates, key=lambda exp: (abs((exp - short_target).days), exp))
+
+    long_candidates = [exp for exp in expirations if exp > short_exp]
+    if not long_candidates:
+        raise ValueError("No longer-dated expiration after the short leg expiration.")
+
+    long_exp = min(long_candidates, key=lambda exp: (abs((exp - long_target).days), exp))
+
+    return short_exp, long_exp
+
+
+def build_candidate_spread(
+    trade_client: TradingClient,
+    stock_data_client: StockHistoricalDataClient,
+    option_data_client: OptionHistoricalDataClient,
+    underlying: str,
+) -> SpreadCandidate:
+    """
+    Builds a long call calendar spread using only the ATM strike.
+    ATM is defined as the common strike between both expirations that is
+    closest to the current underlying spot price.
+    """
+    next_session = get_next_trading_session_date(trade_client)
+    long_target = next_session + timedelta(days=30)
+    logger.info(
+        "[%s] Building candidate spread with next_session=%s long_target=%s.",
+        underlying,
+        next_session,
+        long_target,
+    )
+
+    spot = get_spot_price(stock_data_client, underlying)
+
+    min_strike = max(0.01, spot * (1.0 - STRIKE_WINDOW_PCT))
+    max_strike = spot * (1.0 + STRIKE_WINDOW_PCT)
+
+    contracts = fetch_call_contracts(
+        trade_client=trade_client,
+        underlying=underlying,
+        min_exp=next_session,
+        max_exp=long_target + timedelta(days=21),
+        min_strike=min_strike,
+        max_strike=max_strike,
+    )
+
+    if not contracts:
+        raise ValueError("No call contracts returned in the target expiration/strike window.")
+
+    short_exp, long_exp = choose_expirations(contracts, next_session, long_target)
+    logger.info("[%s] Selected expirations short=%s long=%s.", underlying, short_exp, long_exp)
+
+    short_by_strike: Dict[float, Any] = {
+        float(contract.strike_price): contract
+        for contract in contracts
+        if contract.expiration_date == short_exp
+    }
+    long_by_strike: Dict[float, Any] = {
+        float(contract.strike_price): contract
+        for contract in contracts
+        if contract.expiration_date == long_exp
+    }
+
+    common_strikes = list(set(short_by_strike.keys()) & set(long_by_strike.keys()))
+    if not common_strikes:
+        raise ValueError("No common strike exists between the chosen expirations.")
+
+    atm_strike = min(common_strikes, key=lambda strike: abs(strike - spot))
+    logger.info("[%s] Selected ATM strike %.2f from %s common strikes.", underlying, atm_strike, len(common_strikes))
+
+    short_contract = short_by_strike[atm_strike]
+    long_contract = long_by_strike[atm_strike]
+
+    short_quote = get_latest_option_quote(option_data_client, short_contract.symbol)
+    long_quote = get_latest_option_quote(option_data_client, long_contract.symbol)
+
+    short_bid = float(getattr(short_quote, "bid_price", 0.0) or 0.0)
+    short_ask = float(getattr(short_quote, "ask_price", 0.0) or 0.0)
+    long_bid = float(getattr(long_quote, "bid_price", 0.0) or 0.0)
+    long_ask = float(getattr(long_quote, "ask_price", 0.0) or 0.0)
+
+    if long_ask <= 0:
+        raise ValueError(f"Invalid long ask for ATM strike {atm_strike}")
+    if short_bid < 0:
+        raise ValueError(f"Invalid short bid for ATM strike {atm_strike}")
+
+    natural_debit = long_ask - short_bid
+    mid_debit = ((long_bid + long_ask) / 2.0) - ((short_bid + short_ask) / 2.0)
+
+    if natural_debit <= 0:
+        raise ValueError(f"Non-positive natural debit for ATM strike {atm_strike}")
+
+    logger.info(
+        "[%s] Candidate spread ready: spot=%.2f strike=%.2f short=%s long=%s natural_debit=%.2f mid_debit=%.2f",
+        underlying,
+        spot,
+        atm_strike,
+        short_contract.symbol,
+        long_contract.symbol,
+        natural_debit,
+        mid_debit,
+    )
+    return SpreadCandidate(
+        underlying=underlying,
+        spot=spot,
+        strike=atm_strike,
+        short_exp=short_exp,
+        long_exp=long_exp,
+        short_symbol=short_contract.symbol,
+        long_symbol=long_contract.symbol,
+        short_bid=short_bid,
+        short_ask=short_ask,
+        long_bid=long_bid,
+        long_ask=long_ask,
+        natural_debit=natural_debit,
+        mid_debit=mid_debit,
+    )
+
+
+def choose_limit_debit(candidate: SpreadCandidate) -> float:
+    debit = candidate.mid_debit if USE_MID_DEBIT else candidate.natural_debit
+    debit = max(debit, MIN_NET_DEBIT)
+    return round(debit, 2)
+
+
+def choose_qty(
+    debit_per_spread: float,
+    target_budget_dollars: float,
+    available_value_dollars: float,
+) -> int:
+    """
+    Chooses the integer number of spreads whose total cost is closest to the
+    target budget, without exceeding available funds.
+    """
+    per_spread_cost = debit_per_spread * 100.0
+    if per_spread_cost <= 0:
+        return 0
+    if per_spread_cost > available_value_dollars:
+        return 0
+
+    raw_qty = target_budget_dollars / per_spread_cost
+
+    candidates = {
+        max(1, math.floor(raw_qty)),
+        max(1, math.ceil(raw_qty)),
+        1,
+    }
+
+    feasible = [
+        qty for qty in candidates
+        if qty >= 1 and (qty * per_spread_cost) <= available_value_dollars
+    ]
+    if not feasible:
+        return 0
+
+    return min(
+        feasible,
+        key=lambda qty: (abs((qty * per_spread_cost) - target_budget_dollars), -qty)
+    )
+
+
+def make_order_request(
+    candidate: SpreadCandidate,
+    qty: int,
+    limit_debit: float,
+) -> LimitOrderRequest:
+    return LimitOrderRequest(
+        qty=qty,
+        type=OrderType.LIMIT,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.MLEG,
+        limit_price=limit_debit,
+        client_order_id=(
+            f"cal-{candidate.underlying.lower()}-"
+            f"{candidate.short_exp:%Y%m%d}-{candidate.long_exp:%Y%m%d}-"
+            f"{int(candidate.strike * 100):08d}"
+        ),
+        legs=[
+            OptionLegRequest(
+                symbol=candidate.short_symbol,
+                ratio_qty=1,
+                side=OrderSide.SELL,
+                position_intent="sell_to_open",
+            ),
+            OptionLegRequest(
+                symbol=candidate.long_symbol,
+                ratio_qty=1,
+                side=OrderSide.BUY,
+                position_intent="buy_to_open",
+            ),
+        ],
+    )
+
+
+def paper_trade_calendar_spreads(tickers: List[str]) -> None:
+    tickers = [ticker.upper().strip() for ticker in tickers if ticker.strip()]
+    if not tickers:
+        logger.info("No ticker symbols supplied for paper trading.")
+        return
+
+    trade_client, stock_data_client, option_data_client = get_alpaca_clients()
+
+    initial_available = get_account_value(trade_client)
+    shared_total_budget = initial_available * PCT_OF_AVAILABLE
+    remaining_shared_budget = shared_total_budget
+
+    logger.info(
+        "Starting paper trade session: tickers=%s account_value_field=%s initial_available=%.2f budget_mode=%s dry_run=%s",
+        tickers,
+        ACCOUNT_VALUE_FIELD,
+        initial_available,
+        BUDGET_MODE,
+        DRY_RUN,
+    )
+
+    for i, ticker in enumerate(tickers):
+        try:
+            current_available = get_account_value(trade_client)
+
+            if BUDGET_MODE == "shared_total":
+                remaining_names = len(tickers) - i
+                target_budget = max(0.0, remaining_shared_budget / max(1, remaining_names))
+            else:
+                target_budget = current_available * PCT_OF_AVAILABLE
+            logger.info(
+                "[%s] Budget evaluation: current_available=%.2f target_budget=%.2f remaining_shared_budget=%.2f",
+                ticker,
+                current_available,
+                target_budget,
+                remaining_shared_budget,
+            )
+
+            candidate = build_candidate_spread(
+                trade_client=trade_client,
+                stock_data_client=stock_data_client,
+                option_data_client=option_data_client,
+                underlying=ticker,
+            )
+            limit_debit = choose_limit_debit(candidate)
+            qty = choose_qty(
+                debit_per_spread=limit_debit,
+                target_budget_dollars=target_budget,
+                available_value_dollars=current_available,
+            )
+
+            if qty < 1:
+                logger.info("[%s] Skipped: no feasible quantity at limit debit %.2f.", ticker, limit_debit)
+                continue
+
+            est_total_cost = qty * limit_debit * 100.0
+            req = make_order_request(candidate, qty, limit_debit)
+
+            logger.info(
+                "[%s] Order candidate: spot=%.2f strike=%.2f short_exp=%s short_symbol=%s long_exp=%s long_symbol=%s short_quote=%.2f/%.2f long_quote=%.2f/%.2f limit_debit=%.2f target_budget=%.2f qty=%s est_total_debit=%.2f",
+                ticker,
+                candidate.spot,
+                candidate.strike,
+                candidate.short_exp,
+                candidate.short_symbol,
+                candidate.long_exp,
+                candidate.long_symbol,
+                candidate.short_bid,
+                candidate.short_ask,
+                candidate.long_bid,
+                candidate.long_ask,
+                limit_debit,
+                target_budget,
+                qty,
+                est_total_cost,
+            )
+
+            if DRY_RUN:
+                logger.info("[%s] DRY RUN enabled; order not submitted.", ticker)
+            else:
+                logger.info("[%s] Submitting Alpaca calendar spread order with client_order_id=%s.", ticker, req.client_order_id)
+                order = trade_client.submit_order(req)
+                logger.info(
+                    "[%s] Order submitted successfully: order_id=%s status=%s",
+                    ticker,
+                    order.id,
+                    order.status,
+                )
+
+            if BUDGET_MODE == "shared_total":
+                remaining_shared_budget -= est_total_cost
+                logger.info("[%s] Updated remaining shared budget to %.2f.", ticker, remaining_shared_budget)
+
+        except Exception as exc:
+            logger.exception("[%s] Skipped due to error: %s", ticker, exc)
+
+
+# -----------------------------
+# End-to-end (async)
+# -----------------------------
+async def async_main() -> List[str]:
+    results_pre: Dict[str, str] = {}
+    results_after: Dict[str, str] = {}
+
+    logger.info("Starting async earnings discovery workflow.")
+    try:
+        pre_market_syms, after_market_syms = await get_pre_market_tomorrow_and_after_market_today()
+    except AlphaVantageError as e:
+        logger.exception("Alpha Vantage error while fetching earnings calendar: %s", e)
+        return []
+    except Exception as e:
+        logger.exception("Unexpected error fetching Alpha Vantage calendar: %s", e)
+        return []
+
+    logger.info("Pre-market next session candidate count: %s", len(pre_market_syms))
+    logger.info("After-market today candidate count: %s", len(after_market_syms))
+
+    if not pre_market_syms and not after_market_syms:
+        logger.info("No relevant earnings events found; nothing to score.")
+        return []
+
+    timeout = aiohttp.ClientTimeout(total=30)
+    sem_tradier = asyncio.Semaphore(6)
+
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        # --- Pre-market tomorrow ---
+        if pre_market_syms:
+            logger.info("Scoring pre-market list for next session: %s symbols.", len(pre_market_syms))
+
+            async def eval_one_pre(t: str) -> Optional[Tuple[str, str]]:
+                async with sem_tradier:
+                    rec = await recommend_ticker(session, t)
+                    return (t, rec) if rec != "Avoid" else None
+
+            tasks_pre = [asyncio.create_task(eval_one_pre(t)) for t in pre_market_syms]
+            for fut in asyncio.as_completed(tasks_pre):
+                r = await fut
+                if r:
+                    k, v = r
+                    results_pre[k] = v
+
+        # --- After-market today ---
+        if after_market_syms:
+            logger.info("Scoring after-market list for today: %s symbols.", len(after_market_syms))
+
+            async def eval_one_after(t: str) -> Optional[Tuple[str, str]]:
+                async with sem_tradier:
+                    rec = await recommend_ticker(session, t)
+                    return (t, rec) if rec != "Avoid" else None
+
+            tasks_after = [asyncio.create_task(eval_one_after(t)) for t in after_market_syms]
+            for fut in asyncio.as_completed(tasks_after):
+                r = await fut
+                if r:
+                    k, v = r
+                    results_after[k] = v
+
+    recommended_pre = filter_recommended_sp500_symbols(results_pre)
+    recommended_after = filter_recommended_sp500_symbols(results_after)
+    matching_symbols = sorted(set(recommended_pre) | set(recommended_after))
+
+    logger.info("Finished recommendation scoring. Matching ticker symbols follow.")
+    if matching_symbols:
+        logger.info("Matching ticker symbols: %s", matching_symbols)
+    else:
+        logger.info(
+            "No ticker symbols met all criteria: after-market today or pre-market next session, S&P 500, and Recommended."
+        )
+
+    return matching_symbols
+
+
+def run_trading_session() -> Dict[str, Any]:
+    configure_logging()
+    logger.info("Starting end-to-end trading session run.")
+    symbols = asyncio.run(async_main())
+    if symbols:
+        logger.info("Proceeding to paper-trade %s matching symbols.", len(symbols))
+        paper_trade_calendar_spreads(symbols)
+    else:
+        logger.info("No matching symbols found; skipping paper trading.")
+    return {
+        "matching_symbols": symbols,
+        "submitted_symbol_count": len(symbols),
+    }
+
+
+if __name__ == "__main__":
+    configure_logging()
+    try:
+        run_trading_session()
+    except AlpacaConfigError as exc:
+        logger.exception("Paper trading skipped due to Alpaca configuration error: %s", exc)
