@@ -1,6 +1,6 @@
 from typing import Any, Dict
 
-from trading.earnings_trader import AlpacaConfigError, get_alpaca_clients, minutes_until_session_close, run_trading_session
+from trading.earnings_trader import AlpacaConfigError, TradierError, get_alpaca_clients, minutes_until_session_close, run_trading_session
 from trading.logging_utils import configure_logging, get_logger
 
 
@@ -13,12 +13,16 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     logger.info("Lambda invocation started for earnings-trader: event=%s", event)
 
     try:
-        trade_client, _, _ = get_alpaca_clients()
+        get_alpaca_clients()
     except AlpacaConfigError as exc:
         logger.exception("Lambda is missing Alpaca configuration.")
         raise exc
 
-    minutes_to_close = minutes_until_session_close(trade_client)
+    try:
+        minutes_to_close = minutes_until_session_close()
+    except TradierError as exc:
+        logger.exception("Lambda is missing Tradier configuration.")
+        raise exc
     if minutes_to_close is None:
         logger.info("Skipping run because the market is currently closed.")
         return {

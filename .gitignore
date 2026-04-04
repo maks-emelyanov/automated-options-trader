@@ -29,6 +29,7 @@ ENV/
 
 # Packaging and local tool state
 .cache/
+.codex
 .DS_Store
 pip-wheel-metadata/
 

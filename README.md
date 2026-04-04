@@ -7,7 +7,13 @@ This repository currently contains two scheduled workflows:
 - [`src/trading/earnings_trader.py`](src/trading/earnings_trader.py) evaluates earnings-related calendar spread opportunities and is invoked through [`src/trading/earnings_trader_lambda_handler.py`](src/trading/earnings_trader_lambda_handler.py).
 - [`src/trading/close_options.py`](src/trading/close_options.py) identifies open calendar spreads and submits close orders through [`src/trading/close_options_lambda_handler.py`](src/trading/close_options_lambda_handler.py).
 
-Both Lambda handlers are scheduled during market hours but still verify the Alpaca market clock at runtime so they safely skip holidays, early closes, and off-hours invocations.
+Both Lambda handlers are scheduled during market hours but still verify Tradier market session data at runtime so they safely skip holidays, early closes, and off-hours invocations.
+
+At a high level, the current runtime split is:
+
+- Alpha Vantage for the earnings calendar
+- Tradier for market session checks, stock quotes, option expirations, option chains, and historical market data
+- Alpaca for account sizing data, paper order placement, and open-position inspection during close-outs
 
 ## Important Notice
 
@@ -58,7 +64,9 @@ export ALPACA_SECRET_KEY="..."
 export TRADIER_TOKEN="..."
 ```
 
-The close-options workflow only requires the Alpaca credentials. The earnings workflow uses all four values.
+Both workflows now require all four values. Alpaca is used for account access and order placement, while Tradier is used for market clock/session checks and market data.
+
+The earnings workflow also supports `MARKET_ORDER_SLIPPAGE_PCT` to apply a safety buffer when sizing market-entry calendar spreads. The production Terragrunt config currently sets this to `0.10`, meaning sizing assumes fills may be about 10% worse than the raw quoted debit estimate.
 
 ## Run Locally
 
@@ -111,7 +119,8 @@ Both workflows now emit structured Python logs for:
 
 - Lambda entry and scheduling decisions
 - External API requests and responses
-- Alpaca account, clock, quote, contract, and order operations
+- Tradier market session and market-data operations
+- Alpaca account, position, contract, and order operations
 - Strategy evaluation and skip reasons
 
 These logs are captured by AWS Lambda and appear in CloudWatch Logs.

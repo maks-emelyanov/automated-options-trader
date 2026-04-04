@@ -13,21 +13,15 @@ import csv
 from collections import deque
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    GetOptionContractsRequest,
-    LimitOrderRequest,
+    MarketOrderRequest,
     OptionLegRequest,
 )
 from alpaca.trading.enums import (
-    AssetStatus,
-    ContractType,
     OrderClass,
     OrderSide,
     OrderType,
     TimeInForce,
 )
-from alpaca.data.historical.stock import StockHistoricalDataClient
-from alpaca.data.historical.option import OptionHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest, OptionLatestQuoteRequest
 from trading.logging_utils import configure_logging, get_logger, log_external_request, log_external_response
 
 
@@ -49,9 +43,9 @@ ACCOUNT_VALUE_FIELD = os.getenv("ACCOUNT_VALUE_FIELD", "cash")
 BUDGET_MODE = os.getenv("BUDGET_MODE", "per_symbol")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 STRIKE_WINDOW_PCT = float(os.getenv("STRIKE_WINDOW_PCT", "0.10"))
-CONTRACT_QUERY_LIMIT = int(os.getenv("CONTRACT_QUERY_LIMIT", "10000"))
 USE_MID_DEBIT = os.getenv("USE_MID_DEBIT", "false").lower() == "true"
 MIN_NET_DEBIT = float(os.getenv("MIN_NET_DEBIT", "0.01"))
+MARKET_ORDER_SLIPPAGE_PCT = float(os.getenv("MARKET_ORDER_SLIPPAGE_PCT", "0.10"))
 MARKET_TIMEZONE = os.getenv("MARKET_TIMEZONE", "America/New_York")
 
 class AlphaVantageError(RuntimeError):
@@ -81,6 +75,15 @@ class SpreadCandidate:
     long_ask: float
     natural_debit: float
     mid_debit: float
+
+
+@dataclass
+class TradierOptionContract:
+    symbol: str
+    expiration_date: date
+    strike_price: float
+    bid: float
+    ask: float
 
 
 # -----------------------------
@@ -246,6 +249,27 @@ def filter_results_to_sp500(results: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def filter_symbols_to_sp500(symbols: Iterable[str], sp500: set[str]) -> List[str]:
+    """
+    Return unique symbols that are members of the S&P 500, preserving input order.
+    """
+    candidates = list(symbols)
+    filtered: List[str] = []
+    seen: set[str] = set()
+    for sym in candidates:
+        normalized = _normalize_symbol(sym)
+        if normalized in sp500 and normalized not in seen:
+            filtered.append(sym)
+            seen.add(normalized)
+    logger.info(
+        "Filtering %s candidate symbols against %s S&P 500 symbols yielded %s matches.",
+        len(candidates),
+        len(sp500),
+        len(filtered),
+    )
+    return filtered
+
+
 def filter_recommended_sp500_symbols(results: Dict[str, str]) -> List[str]:
     """
     Return sorted ticker symbols whose recommendation is exactly
@@ -294,6 +318,19 @@ def _tradier_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 
 
+def _market_timezone() -> ZoneInfo:
+    return ZoneInfo(MARKET_TIMEZONE)
+
+
+def _parse_market_time(session_date: date, hhmm: str) -> datetime:
+    hour_str, minute_str = (hhmm or "").split(":", 1)
+    return datetime.combine(
+        session_date,
+        datetime.min.time().replace(hour=int(hour_str), minute=int(minute_str)),
+        tzinfo=_market_timezone(),
+    )
+
+
 async def _json_or_text(resp: aiohttp.ClientResponse) -> Any:
     ctype = resp.headers.get("Content-Type", "")
     if "application/json" in ctype:
@@ -325,6 +362,156 @@ async def _aio_get_json(
     except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
         logger.warning("Tradier network request failed: url=%s error=%s", url, e)
         raise RuntimeError(f"Network error: {e}") from e
+
+
+async def _get_market_clock(session: aiohttp.ClientSession) -> Dict[str, Any]:
+    logger.info("Requesting Tradier market clock.")
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/clock",
+        headers=_tradier_headers(),
+    )
+    clock = data.get("clock") or {}
+    if not clock:
+        raise TradierError("Tradier market clock response did not include clock data.")
+    logger.info(
+        "Fetched Tradier market clock: date=%s state=%s next_change=%s next_state=%s",
+        clock.get("date"),
+        clock.get("state"),
+        clock.get("next_change"),
+        clock.get("next_state"),
+    )
+    return clock
+
+
+def get_tradier_market_clock() -> Dict[str, Any]:
+    async def _fetch() -> Dict[str, Any]:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            return await _get_market_clock(session)
+
+    return asyncio.run(_fetch())
+
+
+async def _get_market_calendar_days(
+    session: aiohttp.ClientSession,
+    *,
+    year: int,
+    month: int,
+    cache: Optional[Dict[Tuple[int, int], List[Dict[str, Any]]]] = None,
+) -> List[Dict[str, Any]]:
+    cache_key = (year, month)
+    if cache is not None and cache_key in cache:
+        logger.info("Using cached Tradier market calendar rows for year=%s month=%s.", year, month)
+        return cache[cache_key]
+
+    logger.info("Requesting Tradier market calendar for year=%s month=%s.", year, month)
+    data = await _aio_get_json(
+        session,
+        f"{TRADIER_BASE_URL}/v1/markets/calendar",
+        params={"year": str(year), "month": f"{month:02d}"},
+        headers=_tradier_headers(),
+    )
+    days = (data.get("calendar") or {}).get("days", {}).get("day", [])
+    if isinstance(days, dict):
+        days = [days]
+    logger.info("Fetched %s Tradier calendar day rows for year=%s month=%s.", len(days), year, month)
+    if cache is not None:
+        cache[cache_key] = days
+    return days
+
+
+async def _get_calendar_day(
+    session: aiohttp.ClientSession,
+    target_date: date,
+    cache: Optional[Dict[Tuple[int, int], List[Dict[str, Any]]]] = None,
+) -> Optional[Dict[str, Any]]:
+    days = await _get_market_calendar_days(
+        session,
+        year=target_date.year,
+        month=target_date.month,
+        cache=cache,
+    )
+    target_iso = target_date.isoformat()
+    for day in days:
+        if day.get("date") == target_iso:
+            return day
+    return None
+
+
+async def _fetch_tradier_session_window(
+    target_date: date,
+) -> Optional[Tuple[datetime, datetime]]:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        calendar_cache: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        day = await _get_calendar_day(session, target_date, cache=calendar_cache)
+        if not day or day.get("status") != "open":
+            logger.info("Tradier calendar shows %s is not an open trading session.", target_date)
+            return None
+        open_info = day.get("open") or {}
+        start = open_info.get("start")
+        end = open_info.get("end")
+        if not start or not end:
+            raise TradierError(f"Tradier calendar day {target_date} did not include open session bounds.")
+        return _parse_market_time(target_date, start), _parse_market_time(target_date, end)
+
+
+def get_tradier_session_window(target_date: date) -> Optional[Tuple[datetime, datetime]]:
+    return asyncio.run(_fetch_tradier_session_window(target_date))
+
+
+async def _fetch_minutes_until_session_close() -> Optional[float]:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        calendar_cache: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        clock = await _get_market_clock(session)
+        if clock.get("state") != "open":
+            logger.info("Tradier market clock indicates the market is not open.")
+            return None
+
+        session_date = datetime.strptime(clock["date"], "%Y-%m-%d").date()
+        day = await _get_calendar_day(session, session_date, cache=calendar_cache)
+        if not day or day.get("status") != "open":
+            logger.info("Tradier calendar shows no open session for %s.", session_date)
+            return None
+        close_time = ((day.get("open") or {}).get("end"))
+        if not close_time:
+            raise TradierError(f"Tradier calendar day {session_date} did not include a close time.")
+
+        now = datetime.fromtimestamp(int(clock["timestamp"]), tz=_market_timezone())
+        close_dt = _parse_market_time(session_date, close_time)
+        minutes_remaining = (close_dt - now).total_seconds() / 60.0
+        logger.info("Tradier clock indicates %.2f minutes until session close.", minutes_remaining)
+        return minutes_remaining
+
+
+def minutes_until_session_close() -> Optional[float]:
+    return asyncio.run(_fetch_minutes_until_session_close())
+
+
+async def _fetch_next_trading_session_date() -> date:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        calendar_cache: Dict[Tuple[int, int], List[Dict[str, Any]]] = {}
+        clock = await _get_market_clock(session)
+        now = datetime.fromtimestamp(int(clock["timestamp"]), tz=_market_timezone())
+        session_date = datetime.strptime(clock["date"], "%Y-%m-%d").date()
+        current_day = await _get_calendar_day(session, session_date, cache=calendar_cache)
+
+        if current_day and current_day.get("status") == "open":
+            open_start = ((current_day.get("open") or {}).get("start"))
+            if not open_start:
+                raise TradierError(f"Tradier calendar day {session_date} did not include an open time.")
+            if now < _parse_market_time(session_date, open_start):
+                logger.info("Tradier next trading session date resolved to %s.", session_date)
+                return session_date
+
+        search_date = session_date + timedelta(days=1)
+        for _ in range(370):
+            day = await _get_calendar_day(session, search_date, cache=calendar_cache)
+            if day and day.get("status") == "open":
+                logger.info("Tradier next trading session date resolved to %s.", search_date)
+                return search_date
+            search_date += timedelta(days=1)
+
+    raise TradierError("Could not determine the next trading session date from Tradier calendar data.")
 
 
 # -----------------------------
@@ -438,6 +625,8 @@ async def get_option_chain(
         )
         rows.append(
             {
+                "symbol": opt.get("symbol"),
+                "expiration": opt.get("expiration_date") or expiration,
                 "type": opt.get("option_type"),
                 "strike": _as_float(opt.get("strike")),
                 "bid": _as_float(opt.get("bid")),
@@ -446,10 +635,14 @@ async def get_option_chain(
             }
         )
     df = pd.DataFrame(rows).dropna(subset=["strike", "bid", "ask"])
-    calls = df[df["type"] == "call"][["strike", "bid", "ask", "impliedVolatility"]].reset_index(
+    calls = df[df["type"] == "call"][
+        ["symbol", "expiration", "strike", "bid", "ask", "impliedVolatility"]
+    ].reset_index(
         drop=True
     )
-    puts = df[df["type"] == "put"][["strike", "bid", "ask", "impliedVolatility"]].reset_index(
+    puts = df[df["type"] == "put"][
+        ["symbol", "expiration", "strike", "bid", "ask", "impliedVolatility"]
+    ].reset_index(
         drop=True
     )
     logger.info(
@@ -790,43 +983,15 @@ async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], L
 # -----------------------------
 def get_alpaca_clients() -> Tuple[
     TradingClient,
-    StockHistoricalDataClient,
-    OptionHistoricalDataClient,
 ]:
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise AlpacaConfigError(
             "Set ALPACA_API_KEY and ALPACA_SECRET_KEY before paper trading."
         )
 
-    logger.info("Initializing Alpaca trading and market data clients for paper trading.")
+    logger.info("Initializing Alpaca trading client for paper trading.")
     trade_client = TradingClient(ALPACA_API_KEY, ALPACA_SECRET_KEY, paper=True)
-    stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-    option_data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
-    return trade_client, stock_data_client, option_data_client
-
-
-def minutes_until_session_close(trade_client: TradingClient) -> Optional[float]:
-    """
-    Returns the number of minutes remaining until the current market session closes.
-
-    Returns None when the market is not currently open.
-    """
-    logger.info("Requesting Alpaca market clock to calculate minutes until session close.")
-    clock = trade_client.get_clock()
-    if not getattr(clock, "is_open", False):
-        logger.info("Alpaca clock indicates the market is closed.")
-        return None
-
-    now = clock.timestamp
-    close_time = clock.next_close
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=ZoneInfo(MARKET_TIMEZONE))
-    if close_time.tzinfo is None:
-        close_time = close_time.replace(tzinfo=ZoneInfo(MARKET_TIMEZONE))
-
-    minutes_remaining = (close_time - now).total_seconds() / 60.0
-    logger.info("Alpaca clock indicates %.2f minutes until session close.", minutes_remaining)
-    return minutes_remaining
+    return (trade_client,)
 
 
 def get_account_value(trade_client: TradingClient) -> float:
@@ -841,116 +1006,98 @@ def get_account_value(trade_client: TradingClient) -> float:
     return value
 
 
-def get_next_trading_session_date(trade_client: TradingClient) -> date:
-    """
-    Uses Alpaca's clock.next_open.
-    - If market is closed before today's open, next_open is today.
-    - If market is currently open, next_open is the following session.
-    - If market is closed after hours, next_open is the following session.
-    """
-    logger.info("Requesting Alpaca market clock to determine the next trading session date.")
-    clock = trade_client.get_clock()
-    next_open_date = clock.next_open.date()
-    logger.info("Alpaca next trading session date resolved to %s.", next_open_date)
-    return next_open_date
+def get_next_trading_session_date() -> date:
+    return asyncio.run(_fetch_next_trading_session_date())
 
 
-def get_spot_price(stock_data_client: StockHistoricalDataClient, symbol: str) -> float:
-    logger.info("Requesting Alpaca latest stock trade for %s.", symbol)
-    resp = stock_data_client.get_stock_latest_trade(
-        StockLatestTradeRequest(symbol_or_symbols=symbol)
-    )
+async def _fetch_tradier_spot_price(symbol: str) -> float:
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+        return await get_current_price(session, symbol)
 
-    if isinstance(resp, dict):
-        trade = resp[symbol]
-    else:
-        trade = resp
 
-    price = float(trade.price)
-    logger.info("Fetched Alpaca latest stock trade for %s: %.4f", symbol, price)
+def get_spot_price(symbol: str) -> float:
+    logger.info("Requesting Tradier latest stock quote for %s.", symbol)
+    price = asyncio.run(_fetch_tradier_spot_price(symbol))
+    logger.info("Fetched Tradier latest stock quote for %s: %.4f", symbol, price)
     return price
 
 
-def get_latest_option_quote(
-    option_data_client: OptionHistoricalDataClient, symbol: str
-):
-    logger.info("Requesting Alpaca latest option quote for %s.", symbol)
-    resp = option_data_client.get_option_latest_quote(
-        OptionLatestQuoteRequest(symbol_or_symbols=symbol)
-    )
-
-    if isinstance(resp, dict):
-        quote = resp[symbol]
-    else:
-        quote = resp
-    logger.info(
-        "Fetched Alpaca latest option quote for %s: bid=%s ask=%s",
-        symbol,
-        getattr(quote, "bid_price", None),
-        getattr(quote, "ask_price", None),
-    )
-    return quote
-
-
-def fetch_call_contracts(
-    trade_client: TradingClient,
+async def _fetch_tradier_call_contracts(
     underlying: str,
     min_exp: date,
     max_exp: date,
     min_strike: float,
     max_strike: float,
-) -> List[Any]:
+) -> List[TradierOptionContract]:
     """
-    Fetch all active call contracts in the requested expiration / strike range.
+    Fetch all Tradier call contracts in the requested expiration / strike range.
     """
-    page_token = None
-    all_contracts: List[Any] = []
     logger.info(
-        "Fetching Alpaca call contracts for %s between expirations %s and %s with strike window %.2f-%.2f.",
+        "Fetching Tradier call contracts for %s between expirations %s and %s with strike window %.2f-%.2f.",
         underlying,
         min_exp,
         max_exp,
         min_strike,
         max_strike,
     )
-
-    while True:
-        req = GetOptionContractsRequest(
-            underlying_symbols=[underlying],
-            status=AssetStatus.ACTIVE,
-            type=ContractType.CALL,
-            expiration_date_gte=min_exp,
-            expiration_date_lte=max_exp,
-            strike_price_gte=f"{min_strike:.2f}",
-            strike_price_lte=f"{max_strike:.2f}",
-            limit=CONTRACT_QUERY_LIMIT,
-            page_token=page_token,
-        )
+    all_contracts: List[TradierOptionContract] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+        expirations = await get_expirations(session, underlying)
+        filtered_expirations = [
+            exp for exp in expirations if min_exp <= datetime.strptime(exp, "%Y-%m-%d").date() <= max_exp
+        ]
         logger.info(
-            "Requesting Alpaca option contracts page for %s with page_token=%s limit=%s.",
+            "Tradier expiration filtering for %s kept %s of %s expirations.",
             underlying,
-            page_token,
-            CONTRACT_QUERY_LIMIT,
-        )
-        resp = trade_client.get_option_contracts(req)
-        contracts = resp.option_contracts or []
-        logger.info(
-            "Received %s option contracts for %s on page_token=%s.",
-            len(contracts),
-            underlying,
-            page_token,
+            len(filtered_expirations),
+            len(expirations),
         )
 
-        for contract in contracts:
-            if getattr(contract, "tradable", True):
-                all_contracts.append(contract)
+        for expiration in filtered_expirations:
+            calls, _ = await get_option_chain(session, underlying, expiration)
+            if calls.empty:
+                continue
 
-        page_token = resp.next_page_token
-        if not page_token:
-            break
+            filtered_calls = calls[
+                (calls["strike"] >= min_strike)
+                & (calls["strike"] <= max_strike)
+                & calls["symbol"].notna()
+            ]
+            if filtered_calls.empty:
+                continue
 
-    logger.info("Collected %s tradable call contracts for %s.", len(all_contracts), underlying)
+            exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+            for row in filtered_calls.itertuples(index=False):
+                all_contracts.append(
+                    TradierOptionContract(
+                        symbol=str(row.symbol),
+                        expiration_date=exp_date,
+                        strike_price=float(row.strike),
+                        bid=float(row.bid),
+                        ask=float(row.ask),
+                    )
+                )
+
+    logger.info("Collected %s Tradier call contracts for %s.", len(all_contracts), underlying)
     return all_contracts
+
+
+def fetch_call_contracts(
+    underlying: str,
+    min_exp: date,
+    max_exp: date,
+    min_strike: float,
+    max_strike: float,
+) -> List[TradierOptionContract]:
+    return asyncio.run(
+        _fetch_tradier_call_contracts(
+            underlying=underlying,
+            min_exp=min_exp,
+            max_exp=max_exp,
+            min_strike=min_strike,
+            max_strike=max_strike,
+        )
+    )
 
 
 def choose_expirations(
@@ -981,9 +1128,6 @@ def choose_expirations(
 
 
 def build_candidate_spread(
-    trade_client: TradingClient,
-    stock_data_client: StockHistoricalDataClient,
-    option_data_client: OptionHistoricalDataClient,
     underlying: str,
 ) -> SpreadCandidate:
     """
@@ -991,7 +1135,7 @@ def build_candidate_spread(
     ATM is defined as the common strike between both expirations that is
     closest to the current underlying spot price.
     """
-    next_session = get_next_trading_session_date(trade_client)
+    next_session = get_next_trading_session_date()
     long_target = next_session + timedelta(days=30)
     logger.info(
         "[%s] Building candidate spread with next_session=%s long_target=%s.",
@@ -1000,13 +1144,12 @@ def build_candidate_spread(
         long_target,
     )
 
-    spot = get_spot_price(stock_data_client, underlying)
+    spot = get_spot_price(underlying)
 
     min_strike = max(0.01, spot * (1.0 - STRIKE_WINDOW_PCT))
     max_strike = spot * (1.0 + STRIKE_WINDOW_PCT)
 
     contracts = fetch_call_contracts(
-        trade_client=trade_client,
         underlying=underlying,
         min_exp=next_session,
         max_exp=long_target + timedelta(days=21),
@@ -1041,13 +1184,10 @@ def build_candidate_spread(
     short_contract = short_by_strike[atm_strike]
     long_contract = long_by_strike[atm_strike]
 
-    short_quote = get_latest_option_quote(option_data_client, short_contract.symbol)
-    long_quote = get_latest_option_quote(option_data_client, long_contract.symbol)
-
-    short_bid = float(getattr(short_quote, "bid_price", 0.0) or 0.0)
-    short_ask = float(getattr(short_quote, "ask_price", 0.0) or 0.0)
-    long_bid = float(getattr(long_quote, "bid_price", 0.0) or 0.0)
-    long_ask = float(getattr(long_quote, "ask_price", 0.0) or 0.0)
+    short_bid = float(short_contract.bid or 0.0)
+    short_ask = float(short_contract.ask or 0.0)
+    long_bid = float(long_contract.bid or 0.0)
+    long_ask = float(long_contract.ask or 0.0)
 
     if long_ask <= 0:
         raise ValueError(f"Invalid long ask for ATM strike {atm_strike}")
@@ -1087,9 +1227,10 @@ def build_candidate_spread(
     )
 
 
-def choose_limit_debit(candidate: SpreadCandidate) -> float:
-    debit = candidate.mid_debit if USE_MID_DEBIT else candidate.natural_debit
-    debit = max(debit, MIN_NET_DEBIT)
+def choose_entry_debit(candidate: SpreadCandidate) -> float:
+    base_debit = candidate.mid_debit if USE_MID_DEBIT else candidate.natural_debit
+    buffered_debit = base_debit * (1.0 + MARKET_ORDER_SLIPPAGE_PCT)
+    debit = max(buffered_debit, MIN_NET_DEBIT)
     return round(debit, 2)
 
 
@@ -1132,14 +1273,14 @@ def choose_qty(
 def make_order_request(
     candidate: SpreadCandidate,
     qty: int,
-    limit_debit: float,
-) -> LimitOrderRequest:
-    return LimitOrderRequest(
+    entry_debit: float,
+) -> MarketOrderRequest:
+    del entry_debit
+    return MarketOrderRequest(
         qty=qty,
-        type=OrderType.LIMIT,
+        type=OrderType.MARKET,
         time_in_force=TimeInForce.DAY,
         order_class=OrderClass.MLEG,
-        limit_price=limit_debit,
         client_order_id=(
             f"cal-{candidate.underlying.lower()}-"
             f"{candidate.short_exp:%Y%m%d}-{candidate.long_exp:%Y%m%d}-"
@@ -1168,7 +1309,7 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
         logger.info("No ticker symbols supplied for paper trading.")
         return
 
-    trade_client, stock_data_client, option_data_client = get_alpaca_clients()
+    (trade_client,) = get_alpaca_clients()
 
     initial_available = get_account_value(trade_client)
     shared_total_budget = initial_available * PCT_OF_AVAILABLE
@@ -1201,27 +1342,25 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
             )
 
             candidate = build_candidate_spread(
-                trade_client=trade_client,
-                stock_data_client=stock_data_client,
-                option_data_client=option_data_client,
                 underlying=ticker,
             )
-            limit_debit = choose_limit_debit(candidate)
+            entry_debit = choose_entry_debit(candidate)
+            base_entry_debit = candidate.mid_debit if USE_MID_DEBIT else candidate.natural_debit
             qty = choose_qty(
-                debit_per_spread=limit_debit,
+                debit_per_spread=entry_debit,
                 target_budget_dollars=target_budget,
                 available_value_dollars=current_available,
             )
 
             if qty < 1:
-                logger.info("[%s] Skipped: no feasible quantity at limit debit %.2f.", ticker, limit_debit)
+                logger.info("[%s] Skipped: no feasible quantity at estimated entry debit %.2f.", ticker, entry_debit)
                 continue
 
-            est_total_cost = qty * limit_debit * 100.0
-            req = make_order_request(candidate, qty, limit_debit)
+            est_total_cost = qty * entry_debit * 100.0
+            req = make_order_request(candidate, qty, entry_debit)
 
             logger.info(
-                "[%s] Order candidate: spot=%.2f strike=%.2f short_exp=%s short_symbol=%s long_exp=%s long_symbol=%s short_quote=%.2f/%.2f long_quote=%.2f/%.2f limit_debit=%.2f target_budget=%.2f qty=%s est_total_debit=%.2f",
+                "[%s] Order candidate: spot=%.2f strike=%.2f short_exp=%s short_symbol=%s long_exp=%s long_symbol=%s short_quote=%.2f/%.2f long_quote=%.2f/%.2f base_entry_debit=%.2f slippage_pct=%.2f estimated_entry_debit=%.2f target_budget=%.2f qty=%s est_total_debit=%.2f",
                 ticker,
                 candidate.spot,
                 candidate.strike,
@@ -1233,7 +1372,9 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
                 candidate.short_ask,
                 candidate.long_bid,
                 candidate.long_ask,
-                limit_debit,
+                base_entry_debit,
+                MARKET_ORDER_SLIPPAGE_PCT,
+                entry_debit,
                 target_budget,
                 qty,
                 est_total_cost,
@@ -1242,7 +1383,11 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
             if DRY_RUN:
                 logger.info("[%s] DRY RUN enabled; order not submitted.", ticker)
             else:
-                logger.info("[%s] Submitting Alpaca calendar spread order with client_order_id=%s.", ticker, req.client_order_id)
+                logger.info(
+                    "[%s] Submitting Alpaca market calendar spread order with client_order_id=%s.",
+                    ticker,
+                    req.client_order_id,
+                )
                 order = trade_client.submit_order(req)
                 logger.info(
                     "[%s] Order submitted successfully: order_id=%s status=%s",
@@ -1283,6 +1428,24 @@ async def async_main() -> List[str]:
         logger.info("No relevant earnings events found; nothing to score.")
         return []
 
+    try:
+        sp500 = get_sp500_tickers()
+    except Exception:
+        logger.exception("Failed to load S&P 500 membership before recommendation scoring.")
+        return []
+
+    pre_market_syms = filter_symbols_to_sp500(pre_market_syms, sp500)
+    after_market_syms = filter_symbols_to_sp500(after_market_syms, sp500)
+    logger.info(
+        "Post-S&P 500 filter candidate count: pre_market_next_session=%s after_market_today=%s",
+        len(pre_market_syms),
+        len(after_market_syms),
+    )
+
+    if not pre_market_syms and not after_market_syms:
+        logger.info("No S&P 500 earnings candidates remained after filtering; nothing to score.")
+        return []
+
     timeout = aiohttp.ClientTimeout(total=30)
     sem_tradier = asyncio.Semaphore(6)
 
@@ -1319,8 +1482,8 @@ async def async_main() -> List[str]:
                     k, v = r
                     results_after[k] = v
 
-    recommended_pre = filter_recommended_sp500_symbols(results_pre)
-    recommended_after = filter_recommended_sp500_symbols(results_after)
+    recommended_pre = sorted(sym for sym, rec in results_pre.items() if rec == "Recommended")
+    recommended_after = sorted(sym for sym, rec in results_after.items() if rec == "Recommended")
     matching_symbols = sorted(set(recommended_pre) | set(recommended_after))
 
     logger.info("Finished recommendation scoring. Matching ticker symbols follow.")

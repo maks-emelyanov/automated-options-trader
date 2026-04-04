@@ -18,8 +18,8 @@ inputs = {
   timeout               = 300
   log_retention_in_days = 14
 
-  # Runs at 9:45 AM ET on weekdays. The Lambda itself checks Alpaca's market
-  # clock and only executes when the market has been open for about 15 minutes,
+  # Runs at 9:45 AM ET on weekdays. The Lambda itself checks Tradier session
+  # data and only executes when the market has been open for about 15 minutes,
   # which keeps holidays and non-session invocations safe.
   schedule_expression = "cron(45 9 ? * MON-FRI *)"
   schedule_timezone   = "America/New_York"
@@ -27,6 +27,7 @@ inputs = {
   environment_variables = {
     ALPACA_API_KEY     = get_env("ALPACA_API_KEY")
     ALPACA_SECRET_KEY  = get_env("ALPACA_SECRET_KEY")
+    TRADIER_TOKEN      = get_env("TRADIER_TOKEN")
     DRY_RUN            = "false"
     MARKET_TIMEZONE    = "America/New_York"
   }

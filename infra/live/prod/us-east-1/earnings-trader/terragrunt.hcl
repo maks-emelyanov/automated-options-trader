@@ -18,8 +18,8 @@ inputs = {
   timeout               = 900
   log_retention_in_days = 14
 
-  # Runs once at 3:45 PM ET on weekdays. The Lambda still checks Alpaca's
-  # market clock so holidays and early closes fail safe.
+  # Runs once at 3:45 PM ET on weekdays. The Lambda still checks Tradier
+  # session data so holidays and early closes fail safe.
   schedule_expression = "cron(45 15 ? * MON-FRI *)"
   schedule_timezone   = "America/New_York"
 
@@ -31,8 +31,8 @@ inputs = {
     MARKET_TIMEZONE      = "America/New_York"
     ACCOUNT_VALUE_FIELD  = "cash"
     BUDGET_MODE          = "per_symbol"
-    CONTRACT_QUERY_LIMIT = "10000"
     DRY_RUN              = "false"
+    MARKET_ORDER_SLIPPAGE_PCT = "0.10"
     MIN_NET_DEBIT        = "0.01"
     PCT_OF_AVAILABLE     = "0.06"
     STRIKE_WINDOW_PCT    = "0.10"
