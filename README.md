@@ -138,10 +138,10 @@ Both workflows now emit structured Python logs for:
 Application log messages use a compact tagged format such as:
 
 ```text
-[INFO] [Workflow] Starting end-to-end trading session run.
-[INFO] [Tradier] Requesting market clock.
-[INFO] [Tradier] [BLK] Fetching current price.
-[INFO] [Workflow] [BLK] Recommendation result: Consider.
+INFO [Workflow] Starting end-to-end trading session run.
+INFO [Tradier] Requesting market clock.
+INFO [Tradier] [BLK] Fetching current price.
+INFO [Workflow] [BLK] Recommendation result: Consider.
 ```
 
 In AWS Lambda, CloudWatch still adds its own outer event metadata and the platform `START` / `END` / `REPORT` lines around these application messages.

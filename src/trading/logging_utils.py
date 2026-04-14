@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional
 
 
 REDACTED_LOG_KEYS = {"apikey", "authorization", "token", "secret", "password"}
-LOG_FORMAT = "[%(levelname)s] %(message)s"
+LOG_FORMAT = "%(levelname)s %(message)s"
 
 
 def configure_logging() -> None:
