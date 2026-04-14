@@ -216,7 +216,7 @@ def build_calendar_pairs(option_positions: List[OptionPositionInfo]) -> List[Cal
                 )
             )
             logger.info(
-                "Matched calendar spread: underlying=%s type=%s strike=%.2f qty=%s expirations=%s/%s",
+                service_message("Workflow", "Matched calendar spread: underlying=%s type=%s strike=%.2f qty=%s expirations=%s/%s"),
                 underlying,
                 contract_type,
                 strike,

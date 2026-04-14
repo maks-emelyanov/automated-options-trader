@@ -39,7 +39,7 @@ def service_message(service: str, message: str) -> str:
 
 
 def symbol_message(symbol: str, message: str) -> str:
-    return f"[{symbol}] {message}"
+    return f"[Workflow] [{symbol}] {message}"
 
 
 def service_symbol_message(service: str, symbol: str, message: str) -> str:

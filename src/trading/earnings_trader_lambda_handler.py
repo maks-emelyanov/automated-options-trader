@@ -9,8 +9,9 @@ logger = get_logger(__name__)
 
 def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     configure_logging()
+    del event
     del context
-    logger.info(service_message("Lambda", "Invocation started for earnings-trader: event=%s"), event)
+    logger.info(service_message("Lambda", "Invocation started for earnings-trader."))
 
     try:
         get_alpaca_clients()

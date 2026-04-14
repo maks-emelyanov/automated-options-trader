@@ -220,7 +220,7 @@ def get_sp500_tickers() -> set[str]:
     and return a set of normalized ticker symbols.
     """
     url = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-    logger.info(service_message("S&P 500", "Loading constituents from %s"), url)
+    logger.info(service_message("DataHub", "Loading S&P 500 constituents from %s"), url)
 
     df = pd.read_csv(url)
 
@@ -234,7 +234,7 @@ def get_sp500_tickers() -> set[str]:
         .astype(str)
         .map(_normalize_symbol)
     )
-    logger.info(service_message("S&P 500", "Loaded %s normalized symbols."), len(symbols))
+    logger.info(service_message("DataHub", "Loaded %s normalized S&P 500 symbols."), len(symbols))
     return set(symbols)
 
 
@@ -247,9 +247,9 @@ def filter_results_to_sp500(results: Dict[str, str]) -> Dict[str, str]:
     try:
         sp500 = get_sp500_tickers()
     except Exception as exc:
-        logger.error(service_message("S&P 500", "Failed to filter results to membership: %s"), exc)
+        logger.error(service_message("DataHub", "Failed to filter results to S&P 500 membership: %s"), exc)
         return {}
-    logger.info(service_message("S&P 500", "Filtering %s recommendations against %s symbols."), len(results), len(sp500))
+    logger.info(service_message("DataHub", "Filtering %s recommendations against %s S&P 500 symbols."), len(results), len(sp500))
     return {
         sym: rec
         for sym, rec in results.items()
@@ -270,7 +270,7 @@ def filter_symbols_to_sp500(symbols: Iterable[str], sp500: set[str]) -> List[str
             filtered.append(sym)
             seen.add(normalized)
     logger.info(
-        service_message("S&P 500", "Filtering %s candidate symbols against %s symbols yielded %s matches."),
+        service_message("DataHub", "Filtering %s candidate symbols against %s S&P 500 symbols yielded %s matches."),
         len(candidates),
         len(sp500),
         len(filtered),
@@ -549,7 +549,7 @@ async def get_price_history(
     session: aiohttp.ClientSession, symbol: str, start_date: datetime, end_date: datetime
 ) -> pd.DataFrame:
     logger.info(
-        symbol_message(symbol, "Fetching price history from %s to %s."),
+        service_symbol_message("Tradier", symbol, "Fetching price history from %s to %s."),
         start_date.strftime("%Y-%m-%d"),
         end_date.strftime("%Y-%m-%d"),
     )
@@ -582,12 +582,12 @@ async def get_price_history(
         ]
     )
     cleaned = df.dropna(subset=["Open", "High", "Low", "Close"]).reset_index(drop=True)
-    logger.info(symbol_message(symbol, "Fetched %s cleaned historical price rows."), len(cleaned))
+    logger.info(service_symbol_message("Tradier", symbol, "Fetched %s cleaned historical price rows."), len(cleaned))
     return cleaned
 
 
 async def get_expirations(session: aiohttp.ClientSession, symbol: str) -> List[str]:
-    logger.info(symbol_message(symbol, "Fetching option expirations."))
+    logger.info(service_symbol_message("Tradier", symbol, "Fetching option expirations."))
     data = await _aio_get_json(
         session,
         f"{TRADIER_BASE_URL}/v1/markets/options/expirations",
@@ -596,17 +596,17 @@ async def get_expirations(session: aiohttp.ClientSession, symbol: str) -> List[s
     )
     exps = data.get("expirations", {}).get("date", [])
     if not exps:
-        logger.info(symbol_message(symbol, "No option expirations returned."))
+        logger.info(service_symbol_message("Tradier", symbol, "No option expirations returned."))
         return []
     expirations = [exps] if isinstance(exps, str) else exps
-    logger.info(symbol_message(symbol, "Fetched %s expirations."), len(expirations))
+    logger.info(service_symbol_message("Tradier", symbol, "Fetched %s expirations."), len(expirations))
     return expirations
 
 
 async def get_option_chain(
     session: aiohttp.ClientSession, symbol: str, expiration: str
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info(symbol_message(symbol, "Fetching option chain for expiration %s."), expiration)
+    logger.info(service_symbol_message("Tradier", symbol, "Fetching option chain for expiration %s."), expiration)
     data = await _aio_get_json(
         session,
         f"{TRADIER_BASE_URL}/v1/markets/options/chains",
@@ -616,7 +616,7 @@ async def get_option_chain(
     options = data.get("options", {}).get("option", [])
     if not options:
         empty = pd.DataFrame(columns=["strike", "bid", "ask", "impliedVolatility"])
-        logger.info(symbol_message(symbol, "No option chain rows returned for expiration %s."), expiration)
+        logger.info(service_symbol_message("Tradier", symbol, "No option chain rows returned for expiration %s."), expiration)
         return empty, empty
     if isinstance(options, dict):
         options = [options]
@@ -653,7 +653,7 @@ async def get_option_chain(
         drop=True
     )
     logger.info(
-        symbol_message(symbol, "Fetched option chain for expiration %s: calls=%s puts=%s"),
+        service_symbol_message("Tradier", symbol, "Fetched option chain for expiration %s: calls=%s puts=%s"),
         expiration,
         len(calls),
         len(puts),
@@ -1318,7 +1318,7 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
     remaining_shared_budget = shared_total_budget
 
     logger.info(
-        "Starting paper trade session: tickers=%s account_value_field=%s initial_available=%.2f budget_mode=%s dry_run=%s",
+        service_message("Workflow", "Starting paper trade session: tickers=%s account_value_field=%s initial_available=%.2f budget_mode=%s dry_run=%s"),
         tickers,
         ACCOUNT_VALUE_FIELD,
         initial_available,
@@ -1429,7 +1429,7 @@ async def async_main() -> List[str]:
     try:
         sp500 = get_sp500_tickers()
     except Exception as exc:
-        logger.error(service_message("S&P 500", "Failed to load membership before recommendation scoring: %s"), exc)
+        logger.error(service_message("DataHub", "Failed to load S&P 500 membership before recommendation scoring: %s"), exc)
         return []
 
     pre_market_syms = filter_symbols_to_sp500(pre_market_syms, sp500)

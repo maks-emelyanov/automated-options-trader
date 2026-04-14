@@ -141,10 +141,18 @@ Application log messages use a compact tagged format such as:
 [INFO] [Workflow] Starting end-to-end trading session run.
 [INFO] [Tradier] Requesting market clock.
 [INFO] [Tradier] [BLK] Fetching current price.
-[INFO] [BLK] Recommendation result: Consider.
+[INFO] [Workflow] [BLK] Recommendation result: Consider.
 ```
 
 In AWS Lambda, CloudWatch still adds its own outer event metadata and the platform `START` / `END` / `REPORT` lines around these application messages.
+
+If you are viewing logs through the AWS CLI, `aws logs tail` supports `--format short`, which hides the log stream name from the CLI output and prints a shorter timestamp plus the message body:
+
+```bash
+aws logs tail /aws/lambda/earnings-trader --since 10m --format short
+```
+
+Other `aws logs` commands such as `filter-log-events` do not have a dedicated flag for hiding the stream name, but you can use `--query` to project only the fields you want to see.
 
 ## Security
 
