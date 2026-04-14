@@ -13,7 +13,14 @@ from alpaca.trading.enums import (
     TimeInForce,
 )
 from alpaca.trading.requests import MarketOrderRequest, OptionLegRequest
-from trading.logging_utils import configure_logging, get_logger, log_external_request, log_external_response
+from trading.logging_utils import (
+    configure_logging,
+    get_logger,
+    log_external_request,
+    log_external_response,
+    service_message,
+    symbol_message,
+)
 
 
 logger = get_logger(__name__)
@@ -57,7 +64,7 @@ def get_trade_client() -> TradingClient:
     secret_key = os.getenv("ALPACA_SECRET_KEY", "")
     if not api_key or not secret_key:
         raise AlpacaConfigError("Set ALPACA_API_KEY and ALPACA_SECRET_KEY before closing positions.")
-    logger.info("Initializing Alpaca trading client for close-options.")
+    logger.info(service_message("Alpaca", "Initializing trading client for close-options."))
     return TradingClient(api_key, secret_key, paper=True)
 
 
@@ -132,7 +139,7 @@ def load_open_option_positions() -> List[OptionPositionInfo]:
             )
         )
 
-    logger.info("Identified %s closeable option positions for close-options.", len(option_positions))
+    logger.info(service_message("Workflow", "Identified %s closeable option positions for close-options."), len(option_positions))
     return option_positions
 
 
@@ -157,7 +164,7 @@ def build_calendar_pairs(option_positions: List[OptionPositionInfo]) -> List[Cal
         grouped[key][pos.side].append({"pos": pos, "remaining": pos.qty})
 
     pairs: List[CalendarPair] = []
-    logger.info("Grouping %s option positions into potential calendar spreads.", len(option_positions))
+    logger.info(service_message("Workflow", "Grouping %s option positions into potential calendar spreads."), len(option_positions))
 
     for (underlying, contract_type, strike), bucket in grouped.items():
         longs = bucket["long"]
@@ -221,7 +228,7 @@ def build_calendar_pairs(option_positions: List[OptionPositionInfo]) -> List[Cal
             long_entry["remaining"] -= qty
             short_entry["remaining"] -= qty
 
-    logger.info("Built %s calendar spread pairs.", len(pairs))
+    logger.info(service_message("Workflow", "Built %s calendar spread pairs."), len(pairs))
     return pairs
 
 
@@ -291,11 +298,11 @@ def describe_pair(pair: CalendarPair) -> str:
 def close_open_calendar_spreads() -> Dict[str, object]:
     configure_logging()
     trade_client = get_trade_client()
-    logger.info("Starting end-to-end close-options session.")
+    logger.info(service_message("Workflow", "Starting end-to-end close-options session."))
     option_positions = load_open_option_positions()
 
     if not option_positions:
-        logger.info("No open option positions found; skipping close-options order submission.")
+        logger.info(service_message("Workflow", "No open option positions found; skipping close-options order submission."))
         return {
             "status": "completed",
             "detected_spread_count": 0,
@@ -307,7 +314,7 @@ def close_open_calendar_spreads() -> Dict[str, object]:
     pairs = build_calendar_pairs(option_positions)
 
     if not pairs:
-        logger.info("No open calendar spreads detected; skipping close-options order submission.")
+        logger.info(service_message("Workflow", "No open calendar spreads detected; skipping close-options order submission."))
         return {
             "status": "completed",
             "detected_spread_count": 0,
@@ -316,9 +323,9 @@ def close_open_calendar_spreads() -> Dict[str, object]:
             "dry_run": is_dry_run(),
         }
 
-    logger.info("Proceeding to close %s detected calendar spread(s).", len(pairs))
+    logger.info(service_message("Workflow", "Proceeding to close %s detected calendar spread(s)."), len(pairs))
     for pair in pairs:
-        logger.info("Calendar spread candidate: %s", describe_pair(pair))
+        logger.info(service_message("Workflow", "Calendar spread candidate: %s"), describe_pair(pair))
 
     submitted_order_count = 0
     failed_order_count = 0
@@ -328,7 +335,7 @@ def close_open_calendar_spreads() -> Dict[str, object]:
         req = make_close_request(pair)
 
         if dry_run:
-            logger.info("[%s] DRY RUN enabled; order not submitted.", pair.underlying)
+            logger.info(symbol_message(pair.underlying, "DRY RUN enabled; order not submitted."))
             continue
 
         try:
@@ -346,14 +353,14 @@ def close_open_calendar_spreads() -> Dict[str, object]:
                 fields={"workflow": "close_options", "client_order_id": req.client_order_id, "underlying": pair.underlying},
                 details=f"order_id={order.id} status={order.status}",
             )
-            logger.info("[%s] Order submitted successfully: order_id=%s status=%s", pair.underlying, order.id, order.status)
+            logger.info(symbol_message(pair.underlying, "Order submitted successfully: order_id=%s status=%s"), order.id, order.status)
             submitted_order_count += 1
         except Exception as exc:
-            logger.exception("[%s] Skipped due to error while closing spread: %s", pair.underlying, exc)
+            logger.error(symbol_message(pair.underlying, "Skipped due to error while closing spread: %s"), exc)
             failed_order_count += 1
 
     logger.info(
-        "Close-options session completed: detected_spread_count=%s submitted_order_count=%s failed_order_count=%s dry_run=%s",
+        service_message("Workflow", "Close-options session completed: detected_spread_count=%s submitted_order_count=%s failed_order_count=%s dry_run=%s"),
         len(pairs),
         submitted_order_count,
         failed_order_count,

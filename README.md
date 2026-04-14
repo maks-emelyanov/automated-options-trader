@@ -73,9 +73,21 @@ The earnings workflow also supports `MARKET_ORDER_SLIPPAGE_PCT` to apply a safet
 Use the `src` layout when invoking the package directly:
 
 ```bash
-PYTHONPATH=src python3 -m trading.earnings_trader_lambda_handler
-PYTHONPATH=src python3 -m trading.close_options_lambda_handler
 PYTHONPATH=src python3 scripts/trading_cli.py --help
+```
+
+To invoke the Lambda handlers locally and see the same application log formatting they use at runtime:
+
+```bash
+PYTHONPATH=src python3 - <<'PY'
+from trading.earnings_trader_lambda_handler import handler
+print(handler({"source": "local-test"}, None))
+PY
+
+PYTHONPATH=src python3 - <<'PY'
+from trading.close_options_lambda_handler import handler
+print(handler({}, None))
+PY
 ```
 
 ## Deploy
@@ -123,7 +135,16 @@ Both workflows now emit structured Python logs for:
 - Alpaca account, position, contract, and order operations
 - Strategy evaluation and skip reasons
 
-These logs are captured by AWS Lambda and appear in CloudWatch Logs.
+Application log messages use a compact tagged format such as:
+
+```text
+[INFO] [Workflow] Starting end-to-end trading session run.
+[INFO] [Tradier] Requesting market clock.
+[INFO] [Tradier] [BLK] Fetching current price.
+[INFO] [BLK] Recommendation result: Consider.
+```
+
+In AWS Lambda, CloudWatch still adds its own outer event metadata and the platform `START` / `END` / `REPORT` lines around these application messages.
 
 ## Security
 
