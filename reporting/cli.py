@@ -947,17 +947,19 @@ def build_grouped_parent_events(events: list[OrderLegEvent]) -> tuple[list[Group
             continue
         if first.contract.expiration == second.contract.expiration:
             continue
-        buy_leg = next((leg for leg in legs if leg.side == "buy"), None)
-        sell_leg = next((leg for leg in legs if leg.side == "sell"), None)
-        if not buy_leg or not sell_leg:
-            continue
-        if buy_leg.contract.expiration < sell_leg.contract.expiration:
-            continue
         intents = {leg.position_intent for leg in legs if leg.position_intent}
         if intents and intents.issubset(ORDER_OPEN_INTENTS):
             intent = "entry"
+            long_leg = next((leg for leg in legs if leg.position_intent == "buy_to_open"), None)
+            short_leg = next((leg for leg in legs if leg.position_intent == "sell_to_open"), None)
+            if not long_leg or not short_leg:
+                continue
         elif intents and intents.issubset(ORDER_CLOSE_INTENTS):
             intent = "exit"
+            long_leg = next((leg for leg in legs if leg.position_intent == "sell_to_close"), None)
+            short_leg = next((leg for leg in legs if leg.position_intent == "buy_to_close"), None)
+            if not long_leg or not short_leg:
+                continue
         else:
             continue
         grouped.append(
@@ -965,16 +967,16 @@ def build_grouped_parent_events(events: list[OrderLegEvent]) -> tuple[list[Group
                 event_id=f"parent::{parent_id}",
                 parent_order_id=parent_id,
                 timestamp=max(leg.timestamp for leg in legs),
-                qty=buy_leg.filled_qty,
-                underlying=buy_leg.contract.underlying,
-                option_type=buy_leg.contract.option_type,
-                strike=buy_leg.contract.strike,
-                short_symbol=sell_leg.symbol,
-                short_expiration=sell_leg.contract.expiration,
-                short_price=sell_leg.price,
-                long_symbol=buy_leg.symbol,
-                long_expiration=buy_leg.contract.expiration,
-                long_price=buy_leg.price,
+                qty=long_leg.filled_qty,
+                underlying=long_leg.contract.underlying,
+                option_type=long_leg.contract.option_type,
+                strike=long_leg.contract.strike,
+                short_symbol=short_leg.symbol,
+                short_expiration=short_leg.contract.expiration,
+                short_price=short_leg.price,
+                long_symbol=long_leg.symbol,
+                long_expiration=long_leg.contract.expiration,
+                long_price=long_leg.price,
                 intent=intent,
                 raw={"parent_order_id": parent_id, "legs": [leg.raw for leg in legs]},
             )
@@ -1159,8 +1161,8 @@ def reconstruct_spreads(db: Database) -> list[SpreadState]:
             match.short_resolved = "closed"
             match.order_events.extend(
                 [
-                    {"kind": "close_long", "order_id": grouped.parent_order_id, "symbol": grouped.long_symbol, "qty": grouped.qty, "price": str(grouped.long_price)},
-                    {"kind": "close_short", "order_id": grouped.parent_order_id, "symbol": grouped.short_symbol, "qty": grouped.qty, "price": str(grouped.short_price)},
+                    {"kind": "close_long", "order_id": f"{grouped.parent_order_id}:long", "symbol": grouped.long_symbol, "qty": grouped.qty, "price": str(grouped.long_price)},
+                    {"kind": "close_short", "order_id": f"{grouped.parent_order_id}:short", "symbol": grouped.short_symbol, "qty": grouped.qty, "price": str(grouped.short_price)},
                 ]
             )
             continue
