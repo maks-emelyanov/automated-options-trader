@@ -7,6 +7,8 @@ This repository currently contains two scheduled workflows:
 - [`src/trading/earnings_trader.py`](src/trading/earnings_trader.py) evaluates earnings-related calendar spread opportunities and is invoked through [`src/trading/earnings_trader_lambda_handler.py`](src/trading/earnings_trader_lambda_handler.py).
 - [`src/trading/close_options.py`](src/trading/close_options.py) identifies open calendar spreads and submits close orders through [`src/trading/close_options_lambda_handler.py`](src/trading/close_options_lambda_handler.py).
 
+It also includes a local reporting CLI under [`reporting/`](reporting/) for syncing Alpaca paper-trading history into SQLite and reconstructing 2-leg calendar spread performance.
+
 Both Lambda handlers are scheduled during market hours but still verify Tradier market session data at runtime so they safely skip holidays, early closes, and off-hours invocations.
 
 At a high level, the current runtime split is:
@@ -22,6 +24,7 @@ This project is experimental trading infrastructure and is not investment advice
 ## What the Repository Includes
 
 - Python application code under `src/trading/`
+- A reporting CLI under `reporting/`
 - Separate Lambda dependency manifests under `requirements/lambda/`
 - Terragrunt live configuration under `infra/live/`
 - A reusable Terraform module for scheduled Lambda deployment under `infra/modules/scheduled-python-lambda/`
@@ -90,6 +93,23 @@ print(handler({}, None))
 PY
 ```
 
+## Reporting CLI
+
+The reporting CLI reconstructs Alpaca paper-trading 2-leg calendar spread history from synced orders, activities, positions, and portfolio history. It stores the local ledger in SQLite and exposes commands for spread lists, detailed spread inspection, P&L summaries, reconciliation, reports, and CSV/JSON exports.
+
+After running `uv sync`, use it from the repository root:
+
+```bash
+uv run python reporting/cli.py --help
+uv run python reporting/cli.py sync --since 2026-01-01
+uv run python reporting/cli.py report monthly
+uv run python reporting/cli.py export spreads --format csv --output exports/spreads.csv
+```
+
+The CLI reads Alpaca credentials from `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`, matching the variables used by the trading workflows. By default it writes `./spreadhist.db`; pass `--db /path/to/spreadhist.db` before the subcommand to use another database.
+
+See [`reporting/README.md`](reporting/README.md) for command details, date-window options, limitations, and Alpaca-specific notes.
+
 ## Deploy
 
 From the repository root:
@@ -119,6 +139,7 @@ If Docker is available, packaging uses the AWS SAM Python `3.12` build image so 
 ## Repository Layout
 
 - `src/trading/`: application code and Lambda handlers
+- `reporting/`: local spread-history reporting CLI
 - `requirements/lambda/`: per-Lambda dependency manifests
 - `scripts/`: local entrypoints and utilities
 - `infra/modules/scheduled-python-lambda/`: reusable Terraform module for scheduled Python Lambdas
