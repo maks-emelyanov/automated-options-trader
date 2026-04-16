@@ -35,7 +35,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     configure_logging()
     del event
     del context
-    logger.info(service_message("Lambda", "Invocation started for close-options."))
 
     try:
         get_trade_client()
@@ -65,9 +64,14 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
 
     result = close_open_calendar_spreads()
     logger.info(
-        service_message("Lambda", "Invocation completed for close-options: detected_spread_count=%s submitted_order_count=%s"),
+        service_message(
+            "Workflow",
+            "Close-options workflow completed: detected_spread_count=%s submitted_order_count=%s failed_order_count=%s dry_run=%s",
+        ),
         result["detected_spread_count"],
         result["submitted_order_count"],
+        result["failed_order_count"],
+        result["dry_run"],
     )
     return {
         "status": "completed",

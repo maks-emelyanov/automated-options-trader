@@ -11,7 +11,6 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     configure_logging()
     del event
     del context
-    logger.info(service_message("Lambda", "Invocation started for earnings-trader."))
 
     try:
         get_alpaca_clients()
@@ -40,7 +39,7 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
         }
 
     result = run_trading_session()
-    logger.info(service_message("Lambda", "Invocation completed for earnings-trader: submitted_symbol_count=%s"), result["submitted_symbol_count"])
+    logger.info(service_message("Workflow", "Earnings-trader workflow completed: submitted_symbol_count=%s"), result["submitted_symbol_count"])
     return {
         "status": "completed",
         "minutes_until_close": round(minutes_to_close, 2),
