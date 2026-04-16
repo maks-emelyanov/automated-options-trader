@@ -4,8 +4,8 @@ from typing import Any, Dict, Optional
 from zoneinfo import ZoneInfo
 
 from trading.close_options import AlpacaConfigError, close_open_calendar_spreads, get_trade_client
-from trading.earnings_trader import TradierError, get_tradier_market_clock, get_tradier_session_window
 from trading.logging_utils import configure_logging, get_logger, service_message
+from trading.tradier_market import TradierError, get_tradier_market_clock, get_tradier_session_window
 
 
 logger = get_logger(__name__)

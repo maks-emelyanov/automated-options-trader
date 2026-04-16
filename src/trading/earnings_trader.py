@@ -383,10 +383,8 @@ async def _get_market_clock(session: aiohttp.ClientSession) -> Dict[str, Any]:
     if not clock:
         raise TradierError("Tradier market clock response did not include clock data.")
     logger.info(
-        service_message("Tradier", "Fetched market clock: date=%s state=%s next_change=%s next_state=%s"),
-        clock.get("date"),
+        service_message("Tradier", "Fetched market clock: state=%s next_state=%s"),
         clock.get("state"),
-        clock.get("next_change"),
         clock.get("next_state"),
     )
     return clock

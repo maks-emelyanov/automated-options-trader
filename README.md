@@ -144,15 +144,15 @@ INFO [Tradier] [BLK] Fetching current price.
 INFO [Workflow] [BLK] Recommendation result: Consider.
 ```
 
-In AWS Lambda, CloudWatch still adds its own outer event metadata and the platform `START` / `END` / `REPORT` lines around these application messages.
+In AWS Lambda, CloudWatch still stores event timestamps and adds the platform `START` / `END` / `REPORT` lines around these application messages.
 
-If you are viewing logs through the AWS CLI, `aws logs tail` supports `--format short`, which hides the log stream name from the CLI output and prints a shorter timestamp plus the message body:
+If you are viewing logs through the AWS CLI, `aws logs tail` always prints a timestamp in both supported text formats. Use `filter-log-events` with a query when you only want the stored message body:
 
 ```bash
-aws logs tail /aws/lambda/earnings-trader --since 10m --format short
+aws logs filter-log-events --log-group-name /aws/lambda/earnings-trader --query 'events[].message' --output text
 ```
 
-Other `aws logs` commands such as `filter-log-events` do not have a dedicated flag for hiding the stream name, but you can use `--query` to project only the fields you want to see.
+The CLI still renders one message per event, so Lambda platform messages may appear alongside application logs unless you add a filter pattern.
 
 ## Security
 

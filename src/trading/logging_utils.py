@@ -8,26 +8,26 @@ REDACTED_LOG_KEYS = {"apikey", "authorization", "token", "secret", "password"}
 LOG_FORMAT = "%(levelname)s %(message)s"
 
 
+def _stdout_handler() -> logging.StreamHandler:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(LOG_FORMAT))
+    return handler
+
+
 def configure_logging() -> None:
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
-    formatter = logging.Formatter(LOG_FORMAT)
 
     # In Lambda, replace platform/root handlers so the message body stays deterministic.
     if os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(formatter)
         root_logger.handlers.clear()
-        root_logger.addHandler(handler)
+        root_logger.addHandler(_stdout_handler())
         return
 
     # Outside Lambda, avoid clobbering test or local handlers.
     if not root_logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setLevel(logging.INFO)
-        handler.setFormatter(formatter)
-        root_logger.addHandler(handler)
+        root_logger.addHandler(_stdout_handler())
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -85,3 +85,7 @@ def log_external_response(
         )
         return
     logger.info(service_message(service, "Request completed: action=%s fields=%s"), action, safe_fields)
+
+
+if os.getenv("AWS_LAMBDA_FUNCTION_NAME"):
+    configure_logging()

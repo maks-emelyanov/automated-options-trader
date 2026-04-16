@@ -14,7 +14,7 @@ inputs = {
   handler               = "trading.earnings_trader_lambda_handler.handler"
   package_source_files  = ["trading/__init__.py", "trading/earnings_trader.py", "trading/earnings_trader_lambda_handler.py", "trading/logging_utils.py"]
   python_version        = "3.12"
-  memory_size           = 512
+  memory_size           = 256
   timeout               = 900
   log_retention_in_days = 14
 
