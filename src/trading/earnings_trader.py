@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple, Iterable
 import io
 import csv
-from collections import deque
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     MarketOrderRequest,
@@ -104,20 +103,6 @@ def _as_float(x):
         return None
 
 
-def _safe_int(x):
-    try:
-        return int(x) if x is not None else None
-    except Exception:
-        return None
-
-
-def _safe_float(x):
-    try:
-        return float(x) if x is not None else None
-    except Exception:
-        return None
-
-
 def _log_http_request(service: str, url: str, *, params: Optional[Dict[str, Any]] = None) -> None:
     log_external_request(logger, service, "GET", fields={"url": url, **(params or {})})
 
@@ -193,16 +178,6 @@ def build_term_structure(days, ivs):
     return term_spline
 
 
-def is_tomorrow(s: str, fmt: str = "%Y-%m-%d", tz: str = "America/New_York") -> bool:
-    tzinfo = ZoneInfo(tz)
-    tomorrow = (datetime.now(tzinfo).date() + timedelta(days=1))
-    try:
-        d = datetime.strptime(s, fmt).date()
-    except ValueError:
-        return False
-    return d == tomorrow
-
-
 # -----------------------------
 # S&P 500 helpers
 # -----------------------------
@@ -238,25 +213,6 @@ def get_sp500_tickers() -> set[str]:
     return set(symbols)
 
 
-def filter_results_to_sp500(results: Dict[str, str]) -> Dict[str, str]:
-    """
-    Given the results dict from async_main (symbol -> recommendation),
-    return a new dict containing only symbols that are in the S&P 500.
-    If fetching the S&P list fails, return an empty dict.
-    """
-    try:
-        sp500 = get_sp500_tickers()
-    except Exception as exc:
-        logger.error(service_message("DataHub", "Failed to filter results to S&P 500 membership: %s"), exc)
-        return {}
-    logger.info(service_message("DataHub", "Filtering %s recommendations against %s S&P 500 symbols."), len(results), len(sp500))
-    return {
-        sym: rec
-        for sym, rec in results.items()
-        if _normalize_symbol(sym) in sp500
-    }
-
-
 def filter_symbols_to_sp500(symbols: Iterable[str], sp500: set[str]) -> List[str]:
     """
     Return unique symbols that are members of the S&P 500, preserving input order.
@@ -276,45 +232,6 @@ def filter_symbols_to_sp500(symbols: Iterable[str], sp500: set[str]) -> List[str
         len(filtered),
     )
     return filtered
-
-
-def filter_recommended_sp500_symbols(results: Dict[str, str]) -> List[str]:
-    """
-    Return sorted ticker symbols whose recommendation is exactly
-    "Recommended" and that are members of the S&P 500.
-    """
-    sp500_results = filter_results_to_sp500(results)
-    return sorted(
-        sym
-        for sym, rec in sp500_results.items()
-        if rec == "Recommended"
-    )
-
-
-# -----------------------------
-# Simple per-minute rate limiter
-# -----------------------------
-class PerMinuteRateLimiter:
-    def __init__(self, per_minute: int):
-        self.per_minute = per_minute
-        self.calls: deque[float] = deque()
-        self._lock = asyncio.Lock()
-
-    async def acquire(self):
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            window_start = now - 60.0
-            while self.calls and self.calls[0] < window_start:
-                self.calls.popleft()
-            if len(self.calls) < self.per_minute:
-                self.calls.append(now)
-                return
-            sleep_for = 60.0 - (now - self.calls[0])
-            await asyncio.sleep(max(0.0, sleep_for))
-            now2 = asyncio.get_running_loop().time()
-            while self.calls and self.calls[0] < (now2 - 60.0):
-                self.calls.popleft()
-            self.calls.append(now2)
 
 
 # -----------------------------
@@ -337,13 +254,6 @@ def _parse_market_time(session_date: date, hhmm: str) -> datetime:
         datetime.min.time().replace(hour=int(hour_str), minute=int(minute_str)),
         tzinfo=_market_timezone(),
     )
-
-
-async def _json_or_text(resp: aiohttp.ClientResponse) -> Any:
-    ctype = resp.headers.get("Content-Type", "")
-    if "application/json" in ctype:
-        return await resp.json()
-    return await resp.text()
 
 
 async def _aio_get_json(
@@ -689,7 +599,6 @@ async def recommend_ticker(session: aiohttp.ClientSession, ticker: str) -> str:
             return "Avoid"
 
         atm_iv_by_exp = {}
-        straddle_mid = None
         for i, exp in enumerate(exps):
             calls, puts = await get_option_chain(session, symbol, exp)
             if calls.empty or puts.empty:
@@ -709,12 +618,6 @@ async def recommend_ticker(session: aiohttp.ClientSession, ticker: str) -> str:
             else:
                 atm_iv = (call_iv + put_iv) / 2.0
             atm_iv_by_exp[exp] = atm_iv
-
-            if i == 0:
-                cb, ca = calls.loc[call_idx, "bid"], calls.loc[call_idx, "ask"]
-                pb, pa = puts.loc[put_idx, "bid"], puts.loc[put_idx, "ask"]
-                if cb is not None and ca is not None and pb is not None and pa is not None:
-                    straddle_mid = (cb + ca) / 2.0 + (pb + pa) / 2.0  # noqa: F841
 
         if not atm_iv_by_exp:
             logger.info(symbol_message(symbol, "Recommendation Avoid: no ATM implied volatility values available."))
@@ -897,14 +800,14 @@ async def fetch_alpha_vantage_calendar(
         return rows
 
 
-async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], List[str]]:
+async def get_pre_market_next_session_and_after_market_today() -> Tuple[List[str], List[str]]:
     """
     Return two unique symbol lists from Alpha Vantage (US/Eastern):
-      - pre_market_tomorrow:  next business day's pre-market earnings
+      - pre_market_next_session:  next business day's pre-market earnings
       - after_market_today:   today's (or next business day's) after-market earnings
 
     If today is Sat/Sun, 'today' is taken as Monday (next business day),
-    and 'tomorrow' is the next business day after that.
+    and 'next_session' is the next business day after that.
     """
     tz = ZoneInfo("America/New_York")
     today = datetime.now(tz).date()
@@ -919,11 +822,11 @@ async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], L
     days_ahead_next = 1
     while (business_today + timedelta(days=days_ahead_next)).weekday() >= 5:
         days_ahead_next += 1
-    business_tomorrow = business_today + timedelta(days=days_ahead_next)
+    next_business_day = business_today + timedelta(days=days_ahead_next)
     logger.info(
-        service_message("Alpha Vantage", "Fetching earnings calendar for business_today=%s business_tomorrow=%s."),
+        service_message("Alpha Vantage", "Fetching earnings calendar for business_today=%s next_business_day=%s."),
         business_today,
-        business_tomorrow,
+        next_business_day,
     )
 
     timeout = aiohttp.ClientTimeout(total=40)
@@ -931,13 +834,13 @@ async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], L
         rows = await fetch_alpha_vantage_calendar(session)
     logger.info(service_message("Alpha Vantage", "Fetched %s earnings calendar rows."), len(rows))
 
-    pre_market_tomorrow: List[str] = []
+    pre_market_next_session: List[str] = []
     after_market_today: List[str] = []
     seen_pre = set()
     seen_after = set()
 
     target_today = business_today.isoformat()
-    target_tomorrow = business_tomorrow.isoformat()
+    target_tomorrow = next_business_day.isoformat()
 
     for r in rows:
         d = (r.get("reportDate") or "").strip()[:10]
@@ -965,21 +868,21 @@ async def get_pre_market_tomorrow_and_after_market_today() -> Tuple[List[str], L
             seen_after.add(sym)
             after_market_today.append(sym)
 
-        # Pre-market earnings for business_tomorrow
+        # Pre-market earnings for next_business_day
         if (
             d == target_tomorrow
             and sym not in seen_pre
             and _is_pre_market_report_time(rt_raw)
         ):
             seen_pre.add(sym)
-            pre_market_tomorrow.append(sym)
+            pre_market_next_session.append(sym)
 
     logger.info(
-        service_message("Alpha Vantage", "Classification complete: pre_market_tomorrow=%s after_market_today=%s"),
-        len(pre_market_tomorrow),
+        service_message("Alpha Vantage", "Classification complete: pre_market_next_session=%s after_market_today=%s"),
+        len(pre_market_next_session),
         len(after_market_today),
     )
-    return pre_market_tomorrow, after_market_today
+    return pre_market_next_session, after_market_today
 
 
 # -----------------------------
@@ -1409,7 +1312,7 @@ async def async_main() -> List[str]:
 
     logger.info(service_message("Workflow", "Starting async earnings discovery workflow."))
     try:
-        pre_market_syms, after_market_syms = await get_pre_market_tomorrow_and_after_market_today()
+        pre_market_syms, after_market_syms = await get_pre_market_next_session_and_after_market_today()
     except AlphaVantageError as e:
         logger.error(service_message("Alpha Vantage", "Error while fetching earnings calendar: %s"), e)
         return []

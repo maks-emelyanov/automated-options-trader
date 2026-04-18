@@ -32,6 +32,7 @@ ENV/
 .codex
 .DS_Store
 pip-wheel-metadata/
+*.db
 
 # Terraform and Terragrunt artifacts
 .terraform/

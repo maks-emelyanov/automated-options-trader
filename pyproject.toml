@@ -24,9 +24,11 @@ classifiers = [
 dependencies = [
     "aiohttp>=3.13.3",
     "alpaca-py>=0.43.2",
+    "click>=8.3.2",
     "numpy>=2.3.0",
     "pandas>=3.0.1",
-    "pytz>=2026.1.post1",
+    "requests>=2.32.5",
+    "rich>=15.0.0",
     "typer>=0.24.1",
 ]
 

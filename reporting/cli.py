@@ -124,10 +124,6 @@ class SpreadState:
             self.notes.append(note)
 
     @property
-    def entry_cash_flow(self) -> Decimal:
-        return -self.entry_debit
-
-    @property
     def realized_pnl(self) -> Decimal:
         return self.cash_flow
 
@@ -591,10 +587,6 @@ class Database:
             (key, value),
         )
         self.conn.commit()
-
-    def get_metadata(self, key: str) -> Optional[str]:
-        row = self.conn.execute("SELECT value FROM metadata WHERE key = ?", (key,)).fetchone()
-        return row[0] if row else None
 
     def upsert_orders(self, orders: Iterable[dict[str, Any]]) -> int:
         count = 0

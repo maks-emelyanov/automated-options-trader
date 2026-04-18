@@ -2,4 +2,3 @@ aiohttp>=3.13.3
 alpaca-py>=0.43.2
 numpy>=2.3.0
 pandas>=3.0.1
-pytz>=2026.1.post1
