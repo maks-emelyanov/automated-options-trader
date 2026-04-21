@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 from trading.logging_utils import get_logger, log_external_request, log_external_response, service_message
+from trading.retry_utils import call_with_retries
 
 
 logger = get_logger(__name__)
@@ -53,21 +54,29 @@ def _get_json(path: str, *, params: Optional[Dict[str, str]] = None, timeout: fl
         },
         method="GET",
     )
-    log_external_request(logger, "Tradier", "GET", fields={"url": url, **(params or {})})
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-            log_external_response(logger, "Tradier", "GET", fields={"url": url, "status": response.status, **(params or {})})
-            return payload
-    except HTTPError as exc:
-        log_external_response(logger, "Tradier", "GET", fields={"url": url, "status": exc.code, **(params or {})}, details="http_error")
-        raise TradierError(f"HTTP error {exc.code}: {exc.reason}") from exc
-    except URLError as exc:
-        logger.warning(service_message("Tradier", "Network request failed: url=%s error=%s"), url, exc.reason)
-        raise TradierError(f"Network error: {exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        logger.warning(service_message("Tradier", "Response was not valid JSON: url=%s"), url)
-        raise TradierError("Tradier response was not valid JSON.") from exc
+
+    def _request() -> Any:
+        log_external_request(logger, "Tradier", "GET", fields={"url": url, **(params or {})})
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+                log_external_response(logger, "Tradier", "GET", fields={"url": url, "status": response.status, **(params or {})})
+                return payload
+        except HTTPError as exc:
+            log_external_response(logger, "Tradier", "GET", fields={"url": url, "status": exc.code, **(params or {})}, details="http_error")
+            raise TradierError(f"HTTP error {exc.code}: {exc.reason}") from exc
+        except URLError as exc:
+            logger.warning(service_message("Tradier", "Network request failed: url=%s error=%s"), url, exc.reason)
+            raise TradierError(f"Network error: {exc.reason}") from exc
+        except json.JSONDecodeError as exc:
+            logger.warning(service_message("Tradier", "Response was not valid JSON: url=%s"), url)
+            raise TradierError("Tradier response was not valid JSON.") from exc
+
+    return call_with_retries(
+        _request,
+        service="Tradier",
+        action="GET",
+    )
 
 
 def get_tradier_market_clock() -> Dict[str, Any]:

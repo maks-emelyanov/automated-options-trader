@@ -30,6 +30,7 @@ from trading.logging_utils import (
     symbol_message,
     service_symbol_message,
 )
+from trading.retry_utils import async_call_with_retries, call_with_retries
 
 
 logger = get_logger(__name__)
@@ -264,22 +265,29 @@ async def _aio_get_json(
     headers=None,
     timeout: float = 20.0,
 ) -> Any:
-    _log_http_request("Tradier", url, params=params)
-    try:
-        async with session.get(url, params=params, headers=headers, timeout=timeout) as r:
-            if r.status == 429:
-                _log_http_response("Tradier", url, status=r.status, params=params, details="rate_limited")
-                raise RuntimeError("API rate limit reached (HTTP 429).")
-            r.raise_for_status()
-            payload = await r.json()
-            _log_http_response("Tradier", url, status=r.status, params=params)
-            return payload
-    except aiohttp.ClientResponseError as e:
-        logger.warning(service_message("Tradier", "Request failed: url=%s status=%s message=%s"), url, e.status, e.message)
-        raise RuntimeError(f"HTTP error {e.status}: {e.message}") from e
-    except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
-        logger.warning(service_message("Tradier", "Network request failed: url=%s error=%s"), url, e)
-        raise RuntimeError(f"Network error: {e}") from e
+    async def _request() -> Any:
+        _log_http_request("Tradier", url, params=params)
+        try:
+            async with session.get(url, params=params, headers=headers, timeout=timeout) as r:
+                if r.status == 429:
+                    _log_http_response("Tradier", url, status=r.status, params=params, details="rate_limited")
+                    raise RuntimeError("API rate limit reached (HTTP 429).")
+                r.raise_for_status()
+                payload = await r.json()
+                _log_http_response("Tradier", url, status=r.status, params=params)
+                return payload
+        except aiohttp.ClientResponseError as e:
+            logger.warning(service_message("Tradier", "Request failed: url=%s status=%s message=%s"), url, e.status, e.message)
+            raise RuntimeError(f"HTTP error {e.status}: {e.message}") from e
+        except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+            logger.warning(service_message("Tradier", "Network request failed: url=%s error=%s"), url, e)
+            raise RuntimeError(f"Network error: {e}") from e
+
+    return await async_call_with_retries(
+        _request,
+        service="Tradier",
+        action="GET",
+    )
 
 
 async def _get_market_clock(session: aiohttp.ClientSession) -> Dict[str, Any]:
@@ -906,7 +914,11 @@ def get_account_value(trade_client: TradingClient) -> float:
     Returns the account value field used for sizing, e.g. cash or buying_power.
     """
     logger.info(service_message("Alpaca", "Requesting account data for sizing using field '%s'."), ACCOUNT_VALUE_FIELD)
-    account = trade_client.get_account()
+    account = call_with_retries(
+        trade_client.get_account,
+        service="Alpaca",
+        action="get_account",
+    )
     raw_value = getattr(account, ACCOUNT_VALUE_FIELD)
     value = float(raw_value)
     logger.info(service_message("Alpaca", "Fetched account field '%s' with value %.2f."), ACCOUNT_VALUE_FIELD, value)
@@ -1288,7 +1300,11 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
                     service_symbol_message("Alpaca", ticker, "Submitting market calendar spread order with client_order_id=%s."),
                     req.client_order_id,
                 )
-                order = trade_client.submit_order(req)
+                order = call_with_retries(
+                    lambda: trade_client.submit_order(req),
+                    service="Alpaca",
+                    action="submit_order",
+                )
                 logger.info(
                     symbol_message(ticker, "Order submitted successfully: order_id=%s status=%s"),
                     order.id,

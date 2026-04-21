@@ -21,6 +21,7 @@ from trading.logging_utils import (
     service_message,
     symbol_message,
 )
+from trading.retry_utils import call_with_retries
 
 
 logger = get_logger(__name__)
@@ -93,7 +94,11 @@ def load_open_option_positions() -> List[OptionPositionInfo]:
     """
     trade_client = get_trade_client()
     log_external_request(logger, "Alpaca", "get_all_positions", fields={"workflow": "close_options"})
-    positions = trade_client.get_all_positions()
+    positions = call_with_retries(
+        trade_client.get_all_positions,
+        service="Alpaca",
+        action="get_all_positions",
+    )
     log_external_response(
         logger,
         "Alpaca",
@@ -118,7 +123,11 @@ def load_open_option_positions() -> List[OptionPositionInfo]:
 
         symbol = position.symbol
         log_external_request(logger, "Alpaca", "get_option_contract", fields={"symbol": symbol})
-        contract = trade_client.get_option_contract(symbol)
+        contract = call_with_retries(
+            lambda: trade_client.get_option_contract(symbol),
+            service="Alpaca",
+            action="get_option_contract",
+        )
         log_external_response(
             logger,
             "Alpaca",
@@ -345,7 +354,11 @@ def close_open_calendar_spreads() -> Dict[str, object]:
                 "submit_order",
                 fields={"workflow": "close_options", "client_order_id": req.client_order_id, "underlying": pair.underlying},
             )
-            order = trade_client.submit_order(req)
+            order = call_with_retries(
+                lambda: trade_client.submit_order(req),
+                service="Alpaca",
+                action="submit_order",
+            )
             log_external_response(
                 logger,
                 "Alpaca",
