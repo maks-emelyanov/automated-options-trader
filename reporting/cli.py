@@ -265,6 +265,22 @@ class DateWindow:
         return self.start is None and self.end_exclusive is None
 
 
+def format_window_bound(value: Optional[datetime]) -> str:
+    if value is None:
+        return "unbounded"
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def print_final_timeframe(window: DateWindow, *, basis: str) -> None:
+    console.print(
+        "Final timeframe: "
+        f"{window.label} | "
+        f"start={format_window_bound(window.start)} | "
+        f"end_exclusive={format_window_bound(window.end_exclusive)} | "
+        f"basis={basis}"
+    )
+
+
 def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
@@ -1441,6 +1457,7 @@ def sync(
         raise typer.BadParameter("Provide ALPACA_API_KEY and ALPACA_SECRET_KEY, or pass --api-key/--api-secret.")
 
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="sync API request window")
     db = get_db()
     client = AlpacaClient(api_key=api_key, api_secret=api_secret, paper=paper)
 
@@ -1479,6 +1496,7 @@ def spreads(
 ) -> None:
     """List reconstructed 2-leg calendar spreads."""
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="spread overlap")
     db = get_db()
     spread_rows = filter_spreads_by_window(reconstruct_spreads(db), window, mode="overlap")
     if underlying:
@@ -1498,6 +1516,7 @@ def open_spreads_cmd(
 ) -> None:
     """Show currently open or broken calendar spreads."""
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="spread open date")
     db = get_db()
     spread_rows = [s for s in reconstruct_spreads(db) if s.status in {"open", "broken", "resolved_unmatched"}]
     spread_rows = filter_spreads_by_window(spread_rows, window, mode="opened")
@@ -1541,6 +1560,7 @@ def closed(
 ) -> None:
     """Show closed calendar spreads."""
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="spread close date")
     db = get_db()
     spread_rows = [s for s in reconstruct_spreads(db) if s.status == "closed"]
     spread_rows = filter_spreads_by_window(spread_rows, window, mode="closed")
@@ -1630,18 +1650,7 @@ def spread(spread_id: str = typer.Argument(..., help="Spread identifier from the
     console.print(events_table)
 
 
-@app.command()
-def pnl(
-    period: str = typer.Option("month", help="Grouping period: day or month."),
-    group_by: str = typer.Option("period", help="Grouping dimension: period or underlying."),
-    since: Optional[str] = typer.Option(None, help="Start window: 11d, 3w, 5m, 10y, or 2026-02-11."),
-    until: Optional[str] = typer.Option(None, help="Optional inclusive end date/date-time, e.g. 2026-03-03."),
-    ytd: bool = typer.Option(False, "--ytd", help="Use the year-to-date window."),
-    all_time: bool = typer.Option(False, "--all", help="Show P&L across all time."),
-) -> None:
-    """Summarize realized P&L across reconstructed spreads."""
-    window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
-    db = get_db()
+def render_pnl_tables(db: Database, window: DateWindow, *, period: str, group_by: str) -> None:
     spread_rows = filter_spreads_by_window(reconstruct_spreads(db), window, mode="anchor")
     buckets: dict[str, dict[str, Decimal | int]] = {}
     for spread in spread_rows:
@@ -1672,6 +1681,22 @@ def pnl(
         )
     console.print(table)
     render_portfolio_table(db, window)
+
+
+@app.command()
+def pnl(
+    period: str = typer.Option("month", help="Grouping period: day or month."),
+    group_by: str = typer.Option("period", help="Grouping dimension: period or underlying."),
+    since: Optional[str] = typer.Option(None, help="Start window: 11d, 3w, 5m, 10y, or 2026-02-11."),
+    until: Optional[str] = typer.Option(None, help="Optional inclusive end date/date-time, e.g. 2026-03-03."),
+    ytd: bool = typer.Option(False, "--ytd", help="Use the year-to-date window."),
+    all_time: bool = typer.Option(False, "--all", help="Show P&L across all time."),
+) -> None:
+    """Summarize realized P&L across reconstructed spreads."""
+    window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="closed date, or open date when still open")
+    db = get_db()
+    render_pnl_tables(db, window, period=period, group_by=group_by)
 
 
 @app.command()
@@ -1717,6 +1742,7 @@ def report(
 ) -> None:
     """Generate a concise strategy report."""
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="closed date, or open date when still open")
     db = get_db()
     all_spreads = reconstruct_spreads(db)
     spread_rows = filter_spreads_by_window(all_spreads, window, mode="anchor")
@@ -1757,7 +1783,7 @@ def report(
 
     if kind in {"daily", "monthly"}:
         group_period = "day" if kind == "daily" else "month"
-        pnl(period=group_period, group_by="period", since=since, until=until, ytd=ytd, all_time=all_time)
+        render_pnl_tables(db, window, period=group_period, group_by="period")
 
     if open_rows:
         console.print("\n[bold]Open or broken spreads[/bold]")
@@ -1776,6 +1802,7 @@ def export(
 ) -> None:
     """Export reconstructed spread data."""
     window = resolve_date_window(since=since, until=until, ytd=ytd, all_time=all_time)
+    print_final_timeframe(window, basis="closed date, or open date when still open")
     db = get_db()
     spread_rows = filter_spreads_by_window(reconstruct_spreads(db), window, mode="anchor")
 
