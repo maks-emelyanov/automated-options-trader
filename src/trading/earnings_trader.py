@@ -104,6 +104,52 @@ def _as_float(x):
         return None
 
 
+def _enum_value(x) -> str:
+    return getattr(x, "value", str(x))
+
+
+def classify_alpaca_error(exc: Exception) -> str:
+    """
+    Bucket Alpaca failures into coarse groups so logs distinguish likely
+    broker/internal instability from request or account validation issues.
+    """
+    message = str(exc).lower()
+    if "internal server error" in message:
+        return "broker_internal_error"
+    if "rate limit" in message or "too many requests" in message:
+        return "rate_limited"
+    if "insufficient" in message or "buying power" in message:
+        return "account_constraint"
+    if "invalid" in message or "validation" in message:
+        return "request_validation_error"
+    return "unknown_submission_error"
+
+
+def serialize_order_request(req: MarketOrderRequest) -> Dict[str, Any]:
+    """
+    Build a log-friendly representation of the outbound MLEG order.
+    """
+    legs = []
+    for leg in req.legs or []:
+        legs.append(
+            {
+                "symbol": leg.symbol,
+                "ratio_qty": leg.ratio_qty,
+                "side": _enum_value(leg.side),
+                "position_intent": _enum_value(leg.position_intent),
+            }
+        )
+
+    return {
+        "qty": req.qty,
+        "type": _enum_value(req.type),
+        "time_in_force": _enum_value(req.time_in_force),
+        "order_class": _enum_value(req.order_class),
+        "client_order_id": req.client_order_id,
+        "legs": legs,
+    }
+
+
 def _log_http_request(service: str, url: str, *, params: Optional[Dict[str, Any]] = None) -> None:
     log_external_request(logger, service, "GET", fields={"url": url, **(params or {})})
 
@@ -1240,6 +1286,8 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
     )
 
     for i, ticker in enumerate(tickers):
+        req = None
+        request_payload = None
         try:
             current_available = get_account_value(trade_client)
 
@@ -1296,14 +1344,33 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
             if DRY_RUN:
                 logger.info(symbol_message(ticker, "DRY RUN enabled; order not submitted."))
             else:
-                logger.info(
-                    service_symbol_message("Alpaca", ticker, "Submitting market calendar spread order with client_order_id=%s."),
-                    req.client_order_id,
+                request_payload = serialize_order_request(req)
+                log_external_request(
+                    logger,
+                    "Alpaca",
+                    "submit_order",
+                    fields={
+                        "workflow": "earnings_trader",
+                        "ticker": ticker,
+                        "client_order_id": req.client_order_id,
+                        "request": request_payload,
+                    },
                 )
                 order = call_with_retries(
                     lambda: trade_client.submit_order(req),
                     service="Alpaca",
                     action="submit_order",
+                )
+                log_external_response(
+                    logger,
+                    "Alpaca",
+                    "submit_order",
+                    fields={
+                        "workflow": "earnings_trader",
+                        "ticker": ticker,
+                        "client_order_id": req.client_order_id,
+                    },
+                    details=f"order_id={order.id} status={order.status}",
                 )
                 logger.info(
                     symbol_message(ticker, "Order submitted successfully: order_id=%s status=%s"),
@@ -1316,7 +1383,16 @@ def paper_trade_calendar_spreads(tickers: List[str]) -> None:
                 logger.info(symbol_message(ticker, "Updated remaining shared budget to %.2f."), remaining_shared_budget)
 
         except Exception as exc:
-            logger.error(symbol_message(ticker, "Skipped due to error: %s"), exc)
+            logger.error(
+                symbol_message(
+                    ticker,
+                    "Skipped due to error: error_type=%s client_order_id=%s request=%s error=%s",
+                ),
+                classify_alpaca_error(exc),
+                req.client_order_id if req is not None else None,
+                request_payload,
+                exc,
+            )
 
 
 # -----------------------------

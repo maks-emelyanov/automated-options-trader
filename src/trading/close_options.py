@@ -77,6 +77,48 @@ def enum_value(x) -> str:
     return getattr(x, "value", str(x))
 
 
+def classify_alpaca_error(exc: Exception) -> str:
+    """
+    Bucket Alpaca failures into coarse groups so logs distinguish likely
+    broker/internal instability from request or account validation issues.
+    """
+    message = str(exc).lower()
+    if "internal server error" in message:
+        return "broker_internal_error"
+    if "rate limit" in message or "too many requests" in message:
+        return "rate_limited"
+    if "insufficient" in message or "buying power" in message:
+        return "account_constraint"
+    if "invalid" in message or "validation" in message:
+        return "request_validation_error"
+    return "unknown_submission_error"
+
+
+def serialize_close_request(req: MarketOrderRequest) -> Dict[str, object]:
+    """
+    Build a log-friendly representation of the outbound MLEG close order.
+    """
+    legs = []
+    for leg in req.legs or []:
+        legs.append(
+            {
+                "symbol": leg.symbol,
+                "ratio_qty": leg.ratio_qty,
+                "side": enum_value(leg.side),
+                "position_intent": enum_value(leg.position_intent),
+            }
+        )
+
+    return {
+        "qty": req.qty,
+        "type": enum_value(req.type),
+        "time_in_force": enum_value(req.time_in_force),
+        "order_class": enum_value(req.order_class),
+        "client_order_id": req.client_order_id,
+        "legs": legs,
+    }
+
+
 def get_position_qty_available(position) -> int:
     """
     Prefer qty_available if present so we do not try to close contracts already tied up
@@ -348,11 +390,17 @@ def close_open_calendar_spreads() -> Dict[str, object]:
             continue
 
         try:
+            request_payload = serialize_close_request(req)
             log_external_request(
                 logger,
                 "Alpaca",
                 "submit_order",
-                fields={"workflow": "close_options", "client_order_id": req.client_order_id, "underlying": pair.underlying},
+                fields={
+                    "workflow": "close_options",
+                    "client_order_id": req.client_order_id,
+                    "underlying": pair.underlying,
+                    "request": request_payload,
+                },
             )
             order = call_with_retries(
                 lambda: trade_client.submit_order(req),
@@ -369,7 +417,16 @@ def close_open_calendar_spreads() -> Dict[str, object]:
             logger.info(symbol_message(pair.underlying, "Order submitted successfully: order_id=%s status=%s"), order.id, order.status)
             submitted_order_count += 1
         except Exception as exc:
-            logger.error(symbol_message(pair.underlying, "Skipped due to error while closing spread: %s"), exc)
+            logger.error(
+                symbol_message(
+                    pair.underlying,
+                    "Skipped due to error while closing spread: error_type=%s client_order_id=%s request=%s error=%s",
+                ),
+                classify_alpaca_error(exc),
+                req.client_order_id,
+                request_payload,
+                exc,
+            )
             failed_order_count += 1
 
     logger.info(
