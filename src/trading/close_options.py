@@ -26,6 +26,13 @@ from trading.retry_utils import call_with_retries
 
 logger = get_logger(__name__)
 
+CLOSE_ORDER_SUBMIT_RETRY_ATTEMPTS = int(os.getenv("CLOSE_ORDER_SUBMIT_RETRY_ATTEMPTS", "5"))
+AMBIGUOUS_SUBMIT_ERROR_TYPES = {
+    "broker_internal_error",
+    "rate_limited",
+    "unknown_submission_error",
+}
+
 
 class AlpacaConfigError(RuntimeError):
     pass
@@ -117,6 +124,76 @@ def serialize_close_request(req: MarketOrderRequest) -> Dict[str, object]:
         "client_order_id": req.client_order_id,
         "legs": legs,
     }
+
+
+def lookup_order_by_client_order_id(trade_client: TradingClient, client_order_id: str):
+    """
+    Recover from ambiguous submit failures where Alpaca may have accepted the
+    order but returned an error before the response reached us.
+    """
+    log_external_request(
+        logger,
+        "Alpaca",
+        "get_order_by_client_id",
+        fields={"workflow": "close_options", "client_order_id": client_order_id},
+    )
+    order = call_with_retries(
+        lambda: trade_client.get_order_by_client_id(client_order_id),
+        service="Alpaca",
+        action="get_order_by_client_id",
+    )
+    log_external_response(
+        logger,
+        "Alpaca",
+        "get_order_by_client_id",
+        fields={"workflow": "close_options", "client_order_id": client_order_id},
+        details=f"order_id={order.id} status={order.status}",
+    )
+    return order
+
+
+def submit_close_order(trade_client: TradingClient, req: MarketOrderRequest, *, underlying: str):
+    try:
+        return call_with_retries(
+            lambda: trade_client.submit_order(req),
+            service="Alpaca",
+            action="submit_order",
+            attempts=CLOSE_ORDER_SUBMIT_RETRY_ATTEMPTS,
+        )
+    except Exception as exc:
+        error_type = classify_alpaca_error(exc)
+        if error_type not in AMBIGUOUS_SUBMIT_ERROR_TYPES:
+            raise
+
+        logger.warning(
+            symbol_message(
+                underlying,
+                "Submit failed with ambiguous broker response; checking for existing order by client_order_id=%s before marking failed.",
+            ),
+            req.client_order_id,
+        )
+        try:
+            order = lookup_order_by_client_order_id(trade_client, req.client_order_id)
+        except Exception as lookup_exc:
+            logger.warning(
+                symbol_message(
+                    underlying,
+                    "No recoverable order found after ambiguous submit failure: client_order_id=%s lookup_error=%s",
+                ),
+                req.client_order_id,
+                lookup_exc,
+            )
+            raise exc from lookup_exc
+
+        logger.info(
+            symbol_message(
+                underlying,
+                "Recovered submitted order after ambiguous broker response: order_id=%s status=%s",
+            ),
+            order.id,
+            order.status,
+        )
+        return order
 
 
 def get_position_qty_available(position) -> int:
@@ -402,11 +479,7 @@ def close_open_calendar_spreads() -> Dict[str, object]:
                     "request": request_payload,
                 },
             )
-            order = call_with_retries(
-                lambda: trade_client.submit_order(req),
-                service="Alpaca",
-                action="submit_order",
-            )
+            order = submit_close_order(trade_client, req, underlying=pair.underlying)
             log_external_response(
                 logger,
                 "Alpaca",
